@@ -44,8 +44,9 @@ DeepSeek Harness (dsh) 侧边栏插件：**常用命令行**。把常用的命�
 1. DSH 插件页 → **实验性插件**旁的**更多** → 打开 **自定义插件市场** 开关
 2. 插件页出现 **发现** 标签 → **添加索引源**，输入：
    ```
-   https://gitee.com/stone-axe/dsh-quick-cmd-runner/raw/master/market/index.json
+   https://raw.giteeusercontent.com/stone-axe/dsh-quick-cmd-runner/raw/master/market/index.json
    ```
+   （注意用这个 raw.giteeusercontent.com 域名：gitee.com 的 raw 地址会 302 重定向，DSH 索引源要求无重定向）
 3. 在市场里找到「常用命令行」→ **安装**（确认框会显示来源为本仓库 Git 提交）
 
 ### 方式一：install-bundle（推荐先试）
