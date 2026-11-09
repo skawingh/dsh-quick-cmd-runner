@@ -596,6 +596,14 @@ window.__ModuleLoader__.load({
       var shellState = React.useState(draft.shell || 'auto');
       var shell = shellState[0];
       var setShell = shellState[1];
+      var taRef = React.useRef(null);
+      React.useEffect(function () {
+        var el = taRef.current;
+        if (!el) return;
+        el.style.height = 'auto';
+        var max = Math.floor(window.innerHeight * 0.4);
+        el.style.height = Math.max(64, Math.min(el.scrollHeight + 2, max)) + 'px';
+      }, [command]);
       var valid = command.trim() !== '';
       var detected = detectShellKind(command);
       var kinds = ['auto'];
@@ -620,6 +628,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'qcr-field' },
           h('label', null, t('modal.command')),
           h('textarea', {
+            ref: taRef,
             autoFocus: true, spellCheck: false, value: command,
             placeholder: t('modal.commandPlaceholder'),
             onChange: function (ev) { setCommand(ev.target.value); }

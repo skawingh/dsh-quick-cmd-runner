@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-quick-cmd-runner",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "exports": {
@@ -25,3 +25,4 @@
     }
   }
 }
+
