@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "常用命令行",
+    "description": "在侧边栏管理常用命令行，点击即在新终端执行，自动识别 PowerShell/cmd/bash。"
+  }
+}

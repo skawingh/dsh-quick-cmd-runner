@@ -1,0 +1,11 @@
+[
+  {
+    "id": "qcr-sample",
+    "command": "python --version",
+    "comment": "示例命令：检查 Python 版本（可修改或删除）",
+    "shell": "auto",
+    "runs": 0,
+    "lastRun": 0,
+    "created": 0
+  }
+]

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Quick Commands",
+    "description": "Manage frequently used commands in the sidebar and run each one in a new terminal with automatic shell detection."
+  }
+}
