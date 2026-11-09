@@ -2,6 +2,8 @@
 
 DeepSeek Harness (dsh) 侧边栏插件：**常用命令行**。把常用的命令行存成带注释的列表，点一下就在 DSH 终端里执行，自动判断用 PowerShell / cmd / bash。
 
+主仓库（gitee）：https://gitee.com/stone-axe/dsh-quick-cmd-runner ｜ GitHub 镜像：https://github.com/skawingh/dsh-quick-cmd-runner
+
 ## 功能
 
 - 侧边栏（Ctrl+Alt+B）出现「常用命令行」卡片，点开是独立面板 Tab
@@ -62,11 +64,11 @@ dsh plugin install-bundle <本目录绝对路径> --profile <profile名>
 1. 把本目录放到任意位置，例如 `G:\dsh_plugins\dsh-quick-cmd-runner`
 2. 在 profile 目录建链接（管理员或开发者模式）：
    ```
-   mklink /J "%USERPROFILE%\.dsh\profiles\desktop\node_modules\@local\dsh-quick-cmd-runner" "G:\dsh_plugins\dsh-quick-cmd-runner"
+   mklink /J "%USERPROFILE%\.dsh\profiles\desktop\node_modules\dsh-quick-cmd-runner" "G:\dsh_plugins\dsh-quick-cmd-runner"
    ```
 3. 编辑 `%USERPROFILE%\.dsh\profiles\desktop\package.json`：
-   - `dependencies` 加一行：`"@local/dsh-quick-cmd-runner": "link:G:/dsh_plugins/dsh-quick-cmd-runner"`
-   - `dsh.profile.bundles` 数组加一项：`"@local/dsh-quick-cmd-runner"`
+   - `dependencies` 加一行：`"dsh-quick-cmd-runner": "link:G:/dsh_plugins/dsh-quick-cmd-runner"`
+   - `dsh.profile.bundles` 数组加一项：`"dsh-quick-cmd-runner"`
 4. 重启 DSH 应用
 
 ## 开发结构

@@ -1,4 +1,4 @@
-/** Host half of @local/dsh-quick-cmd-runner.
+/** Host half of dsh-quick-cmd-runner.
  *  Live store: ~/.dsh/quick-cmd-runner/commands.json (pretty JSON, hand-editable in Notepad).
  *  /qcr-reload -> returns store text (seeds from plugin commands.json on first run).
  *  /qcr-save   <- rawInput = JSON array, atomically persisted back to the store file. */

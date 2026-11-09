@@ -1,6 +1,6 @@
-// @local/dsh-quick-cmd-runner — sidebar quick command runner (client half)
+// dsh-quick-cmd-runner — sidebar quick command runner (client half)
 window.__ModuleLoader__.load({
-  id: '@local/dsh-quick-cmd-runner',
+  id: 'dsh-quick-cmd-runner',
   factory: function (require) {
     var module = { exports: {} };
     var exports = module.exports;
@@ -10,11 +10,13 @@ window.__ModuleLoader__.load({
     try { ReactDOM = require('react-dom'); } catch (e) { ReactDOM = null; }
 
     var NS = 'quickCmdRunner';
-    var PACKAGE_ID = '@local/dsh-quick-cmd-runner';
+    var PACKAGE_ID = 'dsh-quick-cmd-runner';
     var TAB_KIND = 'quickCmd';
-    var STORAGE_KEY = '@local/dsh-quick-cmd-runner:v1';
-    var SEED_FLAG_KEY = '@local/dsh-quick-cmd-runner:seeded';
-    var CSS_KEY = '@local/dsh-quick-cmd-runner/panel.css';
+    var STORAGE_KEY = 'dsh-quick-cmd-runner:v1';
+    var SEED_FLAG_KEY = 'dsh-quick-cmd-runner:seeded';
+    var CSS_KEY = 'dsh-quick-cmd-runner/panel.css';
+    var LEGACY_STORAGE_KEY = '@local/dsh-quick-cmd-runner:v1';
+    var LEGACY_SEED_FLAG_KEY = '@local/dsh-quick-cmd-runner:seeded';
     var MAX_ENTRIES = 200;
     var SHELL_OPTIONS = ['auto', 'powershell', 'cmd', 'bash'];
     var SHELL_LABELS = { powershell: 'PowerShell', cmd: 'cmd', bash: 'bash' };
@@ -186,10 +188,23 @@ window.__ModuleLoader__.load({
 
     /* ---------- storage ---------- */
 
+    // 1.1.0 包名去掉 @local 前缀: 一次性把旧 localStorage 键迁到新键(数据与运行统计不丢)
+    function migrateLegacyKeys() {
+      try {
+        if (!localStorage.getItem(STORAGE_KEY) && localStorage.getItem(LEGACY_STORAGE_KEY)) {
+          localStorage.setItem(STORAGE_KEY, localStorage.getItem(LEGACY_STORAGE_KEY));
+        }
+        if (!localStorage.getItem(SEED_FLAG_KEY) && localStorage.getItem(LEGACY_SEED_FLAG_KEY)) {
+          localStorage.setItem(SEED_FLAG_KEY, '1');
+        }
+      } catch (e) {}
+    }
+
     var storeState = null;
     var storeListeners = new Set();
 
     function loadStore() {
+      migrateLegacyKeys();
       try {
         var raw = localStorage.getItem(STORAGE_KEY);
         var data = raw ? JSON.parse(raw) : null;
