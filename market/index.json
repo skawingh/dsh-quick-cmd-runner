@@ -17,11 +17,11 @@
       "versions": [
         {
           "version": "1.0.0",
-          "publishTimestamp": 1794191226,
+          "publishTimestamp": 1794191303,
           "source": {
             "type": "git",
             "url": "https://gitee.com/stone-axe/dsh-quick-cmd-runner.git",
-            "commit": "a7bb94187a709d5b3831cbd6a972d794979beaf1"
+            "commit": "df3614ec234cbdd391b24fa830b600de1ea18389"
           }
         }
       ]
