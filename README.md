@@ -39,6 +39,15 @@ DeepSeek Harness (dsh) 侧边栏插件：**常用命令行**。把常用的命�
 
 ## 安装
 
+### 方式零：插件市场「发现」页安装（最简单）
+
+1. DSH 插件页 → **实验性插件**旁的**更多** → 打开 **自定义插件市场** 开关
+2. 插件页出现 **发现** 标签 → **添加索引源**，输入：
+   ```
+   https://gitee.com/stone-axe/dsh-quick-cmd-runner/raw/master/market/index.json
+   ```
+3. 在市场里找到「常用命令行」→ **安装**（确认框会显示来源为本仓库 Git 提交）
+
 ### 方式一：install-bundle（推荐先试）
 
 ```
@@ -64,6 +73,7 @@ dsh plugin install-bundle <本目录绝对路径> --profile <profile名>
 - `index.js` — Host 半边：注册 `/qcr-reload`（读数据文件）与 `/qcr-save`（原子写回）两个 session command
 - `client.js` — Client 半边：`window.__ModuleLoader__.load` 工厂，面板 UI + 执行链 + 0.8s 防抖落盘同步
 - `cordis.patch.yml` — bundle 装载声明；`locale/` — 中英文案；`icon.svg` — 图标
+- `market/index.json` + `market/icons/` — DSH 插件市场索引（Git 源按 commit 固定；每次发布新版本要更新 `version` / `commit` / `publishTimestamp` 并 push）
 - 改动任何文件后需重启 DSH 应用（模块在启动时装载）
 
 ## 许可
