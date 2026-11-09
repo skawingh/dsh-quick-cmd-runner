@@ -4,7 +4,7 @@
   "description": { "en": "Personal DSH plugin market index.", "zh": "个人 DSH 插件市场索引。" },
   "plugins": [
     {
-      "name": "@local/dsh-quick-cmd-runner",
+      "name": "dsh-quick-cmd-runner",
       "title": { "en": "Quick Command Runner", "zh": "常用命令行" },
       "description": {
         "en": "A sidebar panel of your saved command lines with comments. Click an entry to run it in a fresh DSH terminal tab; shell (PowerShell / CMD / bash) is detected automatically and can be pinned per entry. Commands sync to ~/.dsh/quick-cmd-runner/commands.json.",
@@ -16,21 +16,12 @@
       "repository": { "url": "https://gitee.com/stone-axe/dsh-quick-cmd-runner" },
       "versions": [
         {
-          "version": "1.0.1",
-          "publishTimestamp": 1794191562,
+          "version": "1.1.0",
+          "publishTimestamp": 1794192917,
           "source": {
             "type": "git",
             "url": "https://gitee.com/stone-axe/dsh-quick-cmd-runner.git",
-            "commit": "e069d4d50fb918c024b9c73c0adf4ee738b9d60e"
-          }
-        },
-        {
-          "version": "1.0.0",
-          "publishTimestamp": 1794191303,
-          "source": {
-            "type": "git",
-            "url": "https://gitee.com/stone-axe/dsh-quick-cmd-runner.git",
-            "commit": "df3614ec234cbdd391b24fa830b600de1ea18389"
+            "commit": "2687953ea1b6fb3dc7ec53a6ae61f393e57afa13"
           }
         }
       ]
