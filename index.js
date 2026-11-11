@@ -48,16 +48,18 @@ export function apply(ctx) {
         recordInput: false,
         input: { hint: '<json array>' },
         handler: function (invocation) {
+          var tmp = null;
           try {
             var text = String((invocation && invocation.rawInput) || '').trim();
             var parsed = JSON.parse(text);
             if (!Array.isArray(parsed)) return { kind: 'error', text: '数据不是数组，未写入' };
             fs.mkdirSync(storeDir, { recursive: true });
-            var tmp = storeFile + '.tmp';
+            tmp = storeFile + '.tmp-' + process.pid + '-' + Date.now();
             fs.writeFileSync(tmp, JSON.stringify(parsed, null, 2) + '\n');
             fs.renameSync(tmp, storeFile);
             return { kind: 'success', text: 'ok' };
           } catch (e) {
+            if (tmp) { try { fs.unlinkSync(tmp); } catch (e2) {} }
             return { kind: 'error', text: String((e && e.message) || e) };
           }
         }

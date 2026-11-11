@@ -8,12 +8,25 @@ window.__ModuleLoader__.load({
     var h = React.createElement;
     var ReactDOM = null;
     try { ReactDOM = require('react-dom'); } catch (e) { ReactDOM = null; }
+    // 官方终端图件（存在才用；测试桩/旧宿主缺包时退回自绘 TerminalIcon）
+    var TerminalArtwork = null;
+    try {
+      var primitives = require('@deepseek-ai/dsh-client-ui-primitives');
+      TerminalArtwork = primitives && primitives.PluginArtworkTerminal ? primitives.PluginArtworkTerminal : null;
+    } catch (e) { TerminalArtwork = null; }
 
     var NS = 'quickCmdRunner';
     var PACKAGE_ID = 'dsh-quick-cmd-runner';
     var TAB_KIND = 'quickCmd';
     var STORAGE_KEY = 'dsh-quick-cmd-runner:v1';
     var SEED_FLAG_KEY = 'dsh-quick-cmd-runner:seeded';
+    var SYNC_SESSION_KEY = 'dsh-quick-cmd-runner:sync-session';
+    var TERM_SESSION_KEY = 'dsh-quick-cmd-runner:term-session';
+    var TERM_RECORDS_KEY = 'dsh-quick-cmd-runner:term-records';
+    var TERM_SESSION_TITLE = 'QCR 终端';
+    var TERM_RECORDS_MAX = 12;
+    var MARKER_HEAD = '__QCR_DONE_';
+    var MARKER_TAIL = '__';
     var CSS_KEY = 'dsh-quick-cmd-runner/panel.css';
     var LEGACY_STORAGE_KEY = '@local/dsh-quick-cmd-runner:v1';
     var LEGACY_SEED_FLAG_KEY = '@local/dsh-quick-cmd-runner:seeded';
@@ -50,9 +63,16 @@ window.__ModuleLoader__.load({
       'row.lastRun': '上次运行',
       'row.deleteConfirm': '确定删除这条命令？',
       'panel.reload': '重载',
+      'hint.reloadMirror': '以数据文件为准重载：手改的增、删、改都会生效',
       'status.reloadedOk': '已从 commands.json 重新加载',
-      'status.reloadedNone': 'commands.json 为空或没有新命令',
-      'status.reloadFailed': '重载失败'
+      'status.reloadedNone': 'commands.json 为空，本地列表已同步清空',
+      'status.reloadFailed': '重载失败',
+      'term.title': '终端',
+      'term.new': '新建终端',
+      'term.description': '在会话工作区运行命令',
+      'status.okCentral': '已在「QCR 终端」会话运行',
+      'status.fallback': '「QCR 终端」会话本次启动还没打开过，本次在当前会话运行',
+      'bootstrap.hint': '在左侧会话列表打开一次「QCR 终端」会话，之后命令都会集中到那里的多标签终端执行'
     };
     var EN = {
       'tab.title': 'Quick Commands',
@@ -83,9 +103,16 @@ window.__ModuleLoader__.load({
       'row.lastRun': 'Last run',
       'row.deleteConfirm': 'Delete this command?',
       'panel.reload': 'Reload',
+      'hint.reloadMirror': 'Reload from the data file: hand edits (add/remove/change) all take effect',
       'status.reloadedOk': 'Reloaded from commands.json',
-      'status.reloadedNone': 'commands.json is empty or has nothing new',
-      'status.reloadFailed': 'Reload failed'
+      'status.reloadedNone': 'commands.json is empty; the local list was cleared to match',
+      'status.reloadFailed': 'Reload failed',
+      'term.title': 'Terminal',
+      'term.new': 'New terminal',
+      'term.description': 'Run commands in the Session workspace',
+      'status.okCentral': 'Running in the "QCR Terminal" session',
+      'status.fallback': 'The "QCR Terminal" session has not been opened since launch; running in the current session',
+      'bootstrap.hint': 'Open the "QCR Terminal" session in the session list once; commands will then centralize into its multi-tab terminals'
     };
 
     /* ---------- utilities ---------- */
@@ -135,6 +162,8 @@ window.__ModuleLoader__.load({
     function detectShellKind(command) {
       var text = String(command == null ? '' : command);
       if (!text.trim()) return null;
+      // 批处理文件优先：避免 "tool New-Index.bat" 这类参数先误命中下面的 Get-Xxx PowerShell 模式
+      if (/\.(bat|cmd)\b/i.test(text)) return 'cmd';
       if (/(^|[\s;&|(])([A-Z][a-z]+)-([A-Z][A-Za-z0-9]*)\b/.test(text)) return 'powershell';
       if (/\bpwsh\b|\bpowershell\b|\$env:|\$\w+\s*=|@\{/i.test(text)) return 'powershell';
       if (/%[\w.-]+%|\bfor\s+\/[fldr]\b|\bset\s+\w+\s*=|\.bat\b|\.cmd\b/i.test(text)) return 'cmd';
@@ -167,6 +196,81 @@ window.__ModuleLoader__.load({
       return undefined;
     }
 
+    /* ---------- v1.3.0：集中终端会话的纯函数 ---------- */
+
+    function escQuotePosix(s) { return String(s).replace(/'/g, "'\\''"); }
+    function escQuotePs(s) { return String(s).replace(/'/g, "''"); }
+
+    // cwd 补偿前缀：集中终端跑在「QCR 终端」会话里，须显式 cd 到发起会话的工作目录；
+    // kind 未知时不猜语法（cmd/PS 互不兼容），宁可不 cd 也不把命令写坏
+    function cdPrefix(kind, dir) {
+      if (!dir || !kind) return '';
+      var d = String(dir);
+      if (kind === 'cmd') return 'cd /d "' + d + '" & ';
+      if (kind === 'powershell') return "cd '" + escQuotePs(d) + "'; ";
+      return "cd '" + escQuotePosix(d) + "' && ";
+    }
+
+    // 完成标记包装。非 cmd 把 marker 从倒数第 2 字符处拆开加 ""：
+    // shell 会拼接成完整 marker 输出，而回显行里只有拆开形态 → 输入回显永不误判完成；
+    // cmd 不支持引号拼接，用原样 marker，由扫描器按「回显+输出共两次命中」判定。
+    function wrapCommand(command, kind, marker) {
+      if (kind === 'cmd') return command + ' & echo ' + marker;
+      return command + '; echo ' + marker.slice(0, marker.length - 2) + '""' + marker.slice(-2);
+    }
+
+    function stripAnsi(text) {
+      return String(text)
+        .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+        .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '')
+        .replace(/\x1b[@-Z\\-_]/g, '');
+    }
+
+    var markerBoot = Math.random().toString(36).slice(2, 8);
+    var markerSeq = 0;
+    function nextMarker() {
+      markerSeq += 1;
+      return MARKER_HEAD + markerBoot + '_' + markerSeq.toString(36) + MARKER_TAIL;
+    }
+
+    // 被动扫描器：喂入 render 帧（snapshot → frame.screen，output → frame.data），
+    // ANSI 剥离 + 去空白后累计搜索 marker；snapshot 重置累计（重连后旧内容作废）。
+    // need=1（POSIX/PS，拆分回显不误判）或 2（cmd，回显一次+输出一次）。
+    function makeMarkerScanner(marker, need) {
+      var acc = '';
+      var hits = 0;
+      return {
+        push: function (chunk, isSnapshot) {
+          acc = (isSnapshot ? '' : acc) + stripAnsi(chunk).replace(/\s+/g, '');
+          if (acc.length > 8192) acc = acc.slice(-4096);
+          var from = 0;
+          for (;;) {
+            var at = acc.indexOf(marker, from);
+            if (at < 0) break;
+            hits += 1;
+            from = at + 1;
+            if (hits >= need) return true;
+          }
+          return false;
+        },
+        hits: function () { return hits; }
+      };
+    }
+
+    // 复用必须 kind 匹配：cd/marker 语法按 shell 走，错配会直接把命令写坏；
+    // kind 未知（null）的记录是 untracked，永远不会进入 idle，这里双保险排除。
+    function pickReusable(records, kind) {
+      var list = Array.isArray(records) ? records : [];
+      var best = null;
+      if (!kind) return null;
+      for (var i = 0; i < list.length; i++) {
+        var r = list[i];
+        if (r && r.state === 'idle' && r.kind === kind && (!best || r.startedAt > best.startedAt)) best = r;
+      }
+      return best;
+    }
+
+
     function normalizeEntry(x) {
       if (!x || typeof x.command !== 'string' || !x.command.trim()) return null;
       return {
@@ -180,9 +284,21 @@ window.__ModuleLoader__.load({
       };
     }
 
-    function sortCommands(list) {
+    // 按使用价值排序（runs→lastRun→created），仅用于超过 MAX_ENTRIES 时决定留存哪些条目
+    function rankByUsage(list) {
       return list.slice().sort(function (a, b) {
         return (b.runs - a.runs) || (b.lastRun - a.lastRun) || (a.created - b.created);
+      });
+    }
+
+    // 展示排序：title（comment，缺省回退 command）拼音升序 → 最近调用优先 → 调用次数优先 → 创建时间稳定兜底
+    function sortCommands(list) {
+      return list.slice().sort(function (a, b) {
+        var ta = String(a.comment || a.command || '');
+        var tb = String(b.comment || b.command || '');
+        var byTitle = ta.localeCompare(tb, 'zh');
+        if (byTitle !== 0) return byTitle;
+        return (b.lastRun - a.lastRun) || (b.runs - a.runs) || (a.created - b.created);
       });
     }
 
@@ -250,24 +366,28 @@ window.__ModuleLoader__.load({
       return function () { storeListeners.delete(fn); };
     }
 
-    function mutate(fn) {
+    function mutate(fn, silent) {
       storeState = fn(getStoreSnapshot());
       try { localStorage.setItem(STORAGE_KEY, JSON.stringify(storeState)); } catch (e) {}
       storeListeners.forEach(function (listener) { try { listener(); } catch (e) {} });
-      schedulePush();
+      if (!silent) schedulePush();
     }
 
     function addCommand(entry) {
       var norm = normalizeEntry(entry);
       if (!norm) return;
-      mutate(function (s) { return { version: 1, commands: sortCommands([norm].concat(s.commands)).slice(0, MAX_ENTRIES) }; });
+      mutate(function (s) { return { version: 1, commands: sortCommands(rankByUsage([norm].concat(s.commands)).slice(0, MAX_ENTRIES)) }; });
     }
 
     function updateCommand(entry) {
       var norm = normalizeEntry(entry);
       if (!norm) return;
       mutate(function (s) {
-        return { version: 1, commands: sortCommands(s.commands.map(function (c) { return c.id === norm.id ? norm : c; })) };
+        // 编辑只改 command/comment/shell；运行统计（runs/lastRun/created）沿自原条目，
+        // 否则改个 title 就把「今日已运行」清零（回归见 test-core）
+        return { version: 1, commands: sortCommands(s.commands.map(function (c) {
+          return c.id === norm.id ? Object.assign({}, norm, { runs: c.runs, lastRun: c.lastRun, created: c.created }) : c;
+        })) };
       });
     }
 
@@ -324,13 +444,17 @@ window.__ModuleLoader__.load({
 
     /* ---------- css ---------- */
 
-    var CSS = '.qcr-root{display:flex;flex-direction:column;height:100%;min-height:220px;font-size:12px;color:inherit}' +
+    var CSS =       '.qcr-root{display:flex;flex-direction:column;height:100%;font-size:12px;color:inherit}' +
       '.qcr-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-bottom:1px solid rgba(127,127,127,.25)}' +
       '.qcr-headtitle{font-weight:600}' +
       '.qcr-search{display:flex;align-items:center;gap:6px;padding:6px 10px;border-bottom:1px solid rgba(127,127,127,.18)}' +
       '.qcr-search input{flex:1;min-width:0;background:transparent;border:1px solid rgba(127,127,127,.35);border-radius:4px;padding:3px 6px;color:inherit;font:inherit;outline:none}' +
       '.qcr-search input:focus{border-color:#4c6ef5}' +
-      '.qcr-list{flex:1;overflow:auto;padding:4px 6px}' +
+      '.qcr-list{flex:1;min-height:0;overflow:auto;padding:4px 6px}' +
+      '.qcr-list::-webkit-scrollbar{width:8px}' +
+      '.qcr-list::-webkit-scrollbar-track{background:transparent}' +
+      '.qcr-list::-webkit-scrollbar-thumb{background:rgba(127,127,127,.35);border-radius:4px}' +
+      '.qcr-list::-webkit-scrollbar-thumb:hover{background:rgba(127,127,127,.55)}' +
       '.qcr-row{display:flex;align-items:center;gap:6px;padding:5px 6px;border-radius:4px;cursor:pointer;border:1px solid transparent}' +
       '.qcr-row:hover{background:rgba(127,127,127,.12)}' +
       '.qcr-row:focus-visible{outline:1px solid #4c6ef5}' +
@@ -350,6 +474,8 @@ window.__ModuleLoader__.load({
       '.qcr-status{margin:0 10px 6px;padding:4px 8px;border-radius:4px;font-size:11px}' +
       '.qcr-status-ok{background:rgba(60,160,90,.18)}' +
       '.qcr-status-error{background:rgba(200,60,60,.18)}' +
+      '.qcr-status-warn{background:rgba(200,150,50,.22)}' +
+      '.qcr-bootstrap{margin:6px 10px 0;padding:5px 8px;border-radius:4px;font-size:11px;background:rgba(200,150,50,.22)}' +
       '.qcr-spin{display:inline-block;width:10px;height:10px;border:2px solid rgba(127,127,127,.4);border-top-color:transparent;border-radius:50%;animation:qcr-rotate .8s linear infinite;vertical-align:middle}' +
       '@keyframes qcr-rotate{to{transform:rotate(360deg)}}' +
       '.qcr-mask{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:9999}' +
@@ -432,65 +558,447 @@ window.__ModuleLoader__.load({
       }
     }
 
-    async function openTerminalTab(ctx, sessionId, terminalId) {
+    async function openTerminalTab(ctx, sessionId, params) {
       var sidebar = ctx && ctx.sidebarRight;
       if (sidebar && typeof sidebar.openTabIn === 'function') {
-        await sidebar.openTabIn(sessionId, 'terminal', { params: { terminalId: terminalId } });
+        await sidebar.openTabIn(sessionId, 'terminal', { params: params });
         return;
       }
       if (sidebar && typeof sidebar.openTab === 'function') {
-        await sidebar.openTab('terminal', { params: { terminalId: terminalId } });
+        await sidebar.openTab('terminal', { params: params });
         return;
       }
       throw new Error('无法打开终端标签页');
     }
 
-    async function executeCommand(ctx, sessionId, entry) {
-      var command = String(entry.command || '').trim();
-      if (!command) throw new Error('命令不能为空');
-      if (!sessionId) throw new Error('无法获得当前会话');
-      var pinned = entry.shell && entry.shell !== 'auto' ? entry.shell : null;
-      var detected = detectShellKind(command);
-      var kind = pinned || detected || null;
-      var shells = await loadShellsFor(ctx, sessionId, signalAfter(5000));
-      var shellPath = kind ? pickShellPath(kind, shells) : undefined;
-      var created = valueOf(await ctx.remote.terminal.create(sessionId, {
-        id: 'qcr-' + newId(), cols: 80, rows: 24, shellPath: shellPath
-      }, signalAfter(10000)));
-      var terminalId = null;
-      if (created && typeof created === 'object') terminalId = created.id || created.terminalId || null;
-      else if (typeof created === 'string') terminalId = created;
-      if (!terminalId) throw new Error('创建终端失败');
-      try {
-        valueOf(await ctx.remote.terminal.rename(sessionId, terminalId, String(entry.comment || entry.command).slice(0, 60)));
-      } catch (e) {}
-      await writeCommand(ctx, sessionId, terminalId, command);
-      await openTerminalTab(ctx, sessionId, terminalId);
-      bumpCommand(entry.id);
+    function listTerminalIds(ctx, sessionId) {
+      return Promise.resolve(ctx.remote.terminal.list(sessionId))
+        .then(function (result) {
+          var items = valueOf(result);
+          if (!Array.isArray(items)) return [];
+          return items.map(function (info) { return info && info.id; }).filter(Boolean);
+        })
+        .catch(function () { return []; });
     }
 
-    /* ---------- host file sync (live store: ~/.dsh/quick-cmd-runner/commands.json) ---------- */
+    // openTabs.getSnapshot() 条目形状是 { sessionId, tabId, kind, contentId }（宿主
+    // 投影里没有 id 字段）；早先用 tab.id 取到 undefined，view 键错位成孤儿视图，
+    // 主路径必然超时落入抢席位的兜底 → 标签页永远"只读+接管输入"。一律用 tabId。
+    function tabKeyOf(tab) { return tab && (tab.tabId != null ? tab.tabId : tab.id); }
 
-    var syncCtx = null;
-    var syncSessionId = null;
-    var pushTimer = null;
+    function terminalTabIds(ctx) {
+      try {
+        var tabs = ctx.sidebarRight.openTabs.getSnapshot() || [];
+        return tabs.filter(function (tab) { return tab && tab.kind === 'terminal'; }).map(tabKeyOf);
+      } catch (e) { return []; }
+    }
 
-    function pushStore() {
-      if (!syncCtx || !syncSessionId) return Promise.resolve(false);
-      var remote = syncCtx.remote;
-      if (!remote || !remote.commands || typeof remote.commands.execute !== 'function') return Promise.resolve(false);
-      var payload = JSON.stringify(storeState ? storeState.commands : [], null, 2);
-      return remote.commands.execute(syncSessionId, '/qcr-save ' + payload, [], signalAfter(15000)).then(function (raw) {
-        var exec = valueOf(raw);
-        if (!exec) throw new Error('commands 服务未返回结果');
-        var result = exec.result || exec;
-        if (result && result.kind === 'error') throw new Error(result.text || 'save failed');
-        return true;
+    function terminalTabKeysOf(ctx, sessionId) {
+      var out = [];
+      try {
+        var tabs = ctx.sidebarRight.openTabs.getSnapshot() || [];
+        for (var i = 0; i < tabs.length; i++) {
+          var tab = tabs[i];
+          if (tab && tab.kind === 'terminal' && tab.sessionId === sessionId) out.push(tabKeyOf(tab));
+        }
+      } catch (e) {}
+      return out;
+    }
+
+    function findTerminalTabIn(ctx, sessionId, beforeKeys) {
+      try {
+        var tabs = ctx.sidebarRight.openTabs.getSnapshot() || [];
+        for (var i = 0; i < tabs.length; i++) {
+          var tab = tabs[i];
+          if (tab && tab.kind === 'terminal' && tab.sessionId === sessionId && beforeKeys.indexOf(tabKeyOf(tab)) < 0) return tab;
+        }
+      } catch (e) {}
+      return null;
+    }
+
+    function discoverTabIn(ctx, sessionId, beforeKeys, timeoutMs) {
+      var deadline = Date.now() + (timeoutMs || 3000);
+      return new Promise(function (resolve) {
+        function poll() {
+          var tab = findTerminalTabIn(ctx, sessionId, beforeKeys);
+          if (tab) { resolve(tab); return; }
+          if (Date.now() >= deadline) { resolve(null); return; }
+          setTimeout(poll, 150);
+        }
+        poll();
       });
     }
 
+    function listTerminals(ctx, sessionId) {
+      return Promise.resolve(ctx.remote.terminal.list(sessionId))
+        .then(function (result) {
+          var items = valueOf(result);
+          return Array.isArray(items) ? items : [];
+        })
+        .catch(function () { return []; });
+    }
+
+    function findTerminalTab(ctx, beforeTabIds) {
+      try {
+        var tabs = ctx.sidebarRight.openTabs.getSnapshot() || [];
+        for (var i = 0; i < tabs.length; i++) {
+          var tab = tabs[i];
+          if (tab && tab.kind === 'terminal' && beforeTabIds.indexOf(tabKeyOf(tab)) < 0) return tab;
+        }
+      } catch (e) {}
+      return null;
+    }
+
+    function discoverTab(ctx, beforeTabIds, timeoutMs) {
+      var deadline = Date.now() + (timeoutMs || 8000);
+      return new Promise(function (resolve) {
+        function poll() {
+          var tab = findTerminalTab(ctx, beforeTabIds);
+          if (tab) { resolve(tab); return; }
+          if (Date.now() >= deadline) { resolve(null); return; }
+          setTimeout(poll, 200);
+        }
+        poll();
+      });
+    }
+
+    function waitForWritable(view, timeoutMs) {
+      var deadline = Date.now() + (timeoutMs || 12000);
+      return new Promise(function (resolve, reject) {
+        function poll() {
+          var st = null;
+          try { st = view.state.getSnapshot(); } catch (e) { reject(new Error('终端状态不可读')); return; }
+          if (st && st.phase === 'failed') { reject(new Error('终端创建失败')); return; }
+          if (st && st.writable === true && st.info) { resolve(st); return; }
+          if (Date.now() >= deadline) { reject(new Error('终端等待超时')); return; }
+          setTimeout(poll, 200);
+        }
+        poll();
+      });
+    }
+
+    function discoverTerminal(ctx, sessionId, beforeIds, timeoutMs) {
+      var deadline = Date.now() + (timeoutMs || 12000);
+      return new Promise(function (resolve, reject) {
+        function poll() {
+          listTerminalIds(ctx, sessionId).then(function (ids) {
+            for (var i = 0; i < ids.length; i++) {
+              if (beforeIds.indexOf(ids[i]) < 0) { resolve(ids[i]); return; }
+            }
+            if (Date.now() >= deadline) { reject(new Error('终端未能自动创建，请重试')); return; }
+            setTimeout(poll, 300);
+          });
+        }
+        setTimeout(poll, 250);
+      });
+    }
+
+    function writeWithRetry(ctx, sessionId, terminalId, command, attempts) {
+      return writeCommand(ctx, sessionId, terminalId, command).catch(function (err) {
+        if (attempts <= 1) throw err;
+        return new Promise(function (resolve) { setTimeout(resolve, 600); })
+          .then(function () { return writeWithRetry(ctx, sessionId, terminalId, command, attempts - 1); });
+      });
+    }
+
+    /* The tab view allocates the terminal itself (external create + explicit
+       terminalId lands on the "restore" path, which reads a session-cached
+       inventory that never contains plugin-created terminals -> "此终端已不
+       存在"). And an external attach STEALS the single input seat (last
+       attach wins; on detach the seat goes to nobody -> tab shows 只读 +
+       接管输入). So: open a fresh tab, grab its TerminalView via the shared
+       webTerminals service and type through the tab's own attachment. */
+    function attachFallback(ctx, sessionId, beforeTerms, command, entry, view) {
+      return discoverTerminal(ctx, sessionId, beforeTerms, 12000)
+        .then(function (terminalId) {
+          return Promise.resolve(ctx.remote.terminal.rename(sessionId, terminalId, String(entry.comment || entry.command).slice(0, 60)))
+            .catch(function () { return null; })
+            .then(function () { return writeWithRetry(ctx, sessionId, terminalId, command, 3); })
+            .then(function () {
+              // 兜底 attach 抢走了输入席位, 写完让标签页自己重连抢回 (等价于用户点"接管输入")
+              if (view && typeof view.connect === 'function') { try { view.connect(); } catch (e) {} }
+            });
+        });
+    }
+
+    var runningIds = new Set();
+    var execChain = Promise.resolve();
+
+    // 旧行为回退：命令在当前聊天会话里新开终端 tab（无 cwd 补偿、无完成跟踪）
+    function runLegacy(ctx, sessionId, entry, command) {
+      var pinned = entry.shell && entry.shell !== 'auto' ? entry.shell : null;
+      var detected = detectShellKind(command);
+      var kind = pinned || detected || null;
+      var params = {};
+      var beforeTabs = [];
+      var beforeTerms = [];
+      var step = Promise.resolve();
+      if (kind) {
+        step = loadShellsFor(ctx, sessionId, signalAfter(5000)).then(function (shells) {
+          var shellPath = pickShellPath(kind, shells);
+          if (shellPath) params.shellPath = shellPath;
+        });
+      }
+      return step
+        .then(function () {
+          return Promise.all([
+            Promise.resolve(terminalTabIds(ctx)),
+            listTerminalIds(ctx, sessionId)
+          ]);
+        })
+        .then(function (r) {
+          beforeTabs = r[0];
+          beforeTerms = r[1];
+          return openTerminalTab(ctx, sessionId, params);
+        })
+        .then(function () { return discoverTab(ctx, beforeTabs, 8000); })
+        .then(function (tab) {
+          if (!tab) throw new Error('终端标签未能打开，请重试');
+          var view = null;
+          try { view = ctx.webTerminals.view(sessionId, tabKeyOf(tab), tab.contentId, void 0, params.shellPath); } catch (e) { view = null; }
+          if (!(view && typeof view.write === 'function' && view.state && typeof view.state.getSnapshot === 'function')) {
+            return attachFallback(ctx, sessionId, beforeTerms, command, entry);
+          }
+          try {
+            if (typeof view.refresh === 'function' && view.state.getSnapshot().phase === 'idle') view.refresh();
+          } catch (e) {}
+          return waitForWritable(view, 12000)
+            .then(function (st) {
+              var title = String(entry.comment || entry.command).slice(0, 60);
+              var rename = st.info && st.info.id
+                ? Promise.resolve(ctx.remote.terminal.rename(sessionId, st.info.id, title)).catch(function () { return null; })
+                : Promise.resolve();
+              return rename.then(function () { view.write(command + '\r'); });
+            })
+            .catch(function () { return attachFallback(ctx, sessionId, beforeTerms, command, entry, view); });
+        })
+        .then(function () { bumpCommand(entry.id); });
+    }
+
+    /* ---------- v1.3.0：集中式执行 ----------
+       优先把命令发进专用「QCR 终端」会话；该会话的侧栏 store 没被宿主 adopt
+       （每次应用启动后从未点开过）时 openTabIn 静默无效 → 校验轮询发现新 tab
+       没出现就抛 not-adopted，退回旧行为并在面板提示用户打开一次。 */
+
+    function notAdoptedError() {
+      var err = new Error('「QCR 终端」会话尚未被打开（未 adopt）');
+      err.reason = 'not-adopted';
+      return err;
+    }
+
+    async function runCentralized(ctx, sessionId, entry, command) {
+      var termId = await getTermSession(ctx, false);
+      if (!termId) { var ne = new Error('宿主不支持 remote.session.create'); ne.reason = 'no-central'; throw ne; }
+      if (!termValidated) {
+        // 缓存的集中会话可能已被删除（adoption 残留会是黑洞）：启动后首条命令
+        // 先用 environment 探活，拒绝则强制重建；新会话本轮必然未 adopt，自然
+        // 走 not-adopted 回退并提示。
+        try {
+          valueOf(await ctx.remote.terminal.environment(termId, signalAfter(4000)));
+        } catch (e) {
+          termId = await getTermSession(ctx, true);
+          if (!termId) throw new Error('重建「QCR 终端」会话失败');
+        }
+        termValidated = true;
+      }
+      var pinned = entry.shell && entry.shell !== 'auto' ? entry.shell : null;
+      var kind = pinned || detectShellKind(command) || null;
+      var cwd = null;
+      try {
+        var env = valueOf(await ctx.remote.terminal.environment(sessionId, signalAfter(4000)));
+        cwd = (env && env.cwd) || null;
+      } catch (e) { cwd = null; }
+      var marker = kind ? nextMarker() : null;
+      var fullCommand = cdPrefix(kind, cwd) + (marker ? wrapCommand(command, kind, marker) : command);
+      reconcileRecords(ctx, termId);
+      var rec = pickReusable(loadTermRecords(termId), kind);
+      if (rec && await tryReuse(ctx, termId, rec, entry, fullCommand, marker, kind)) {
+        return { centralized: true };
+      }
+      var params = {};
+      if (kind) {
+        var shells = await loadShellsFor(ctx, termId, signalAfter(5000));
+        var shellPath = pickShellPath(kind, shells);
+        if (shellPath) params.shellPath = shellPath;
+      }
+      return await openCentralizedTab(ctx, termId, entry, params, fullCommand, marker, kind);
+    }
+
+    async function tryReuse(ctx, termId, rec, entry, fullCommand, marker, kind) {
+      var infos = await listTerminals(ctx, termId);
+      var alive = false;
+      for (var i = 0; i < infos.length; i++) {
+        if (infos[i] && infos[i].id === rec.terminalId && infos[i].state === 'running') { alive = true; break; }
+      }
+      if (!alive) { setRecordState(termId, rec.tabKey, 'dead'); return false; }
+      var view = null;
+      try { view = ctx.webTerminals.view(termId, rec.tabKey, rec.contentId, void 0, void 0); } catch (e) { view = null; }
+      var st = null;
+      try { st = view && view.state ? view.state.getSnapshot() : null; } catch (e) { st = null; }
+      // 复用要求连接已就绪（writable 同步可读）；未连接不等待，直接开新 tab
+      if (!st || st.writable !== true || !view || typeof view.write !== 'function') return false;
+      var title = String(entry.comment || entry.command).slice(0, 60);
+      if (st.info && st.info.id) {
+        try { await ctx.remote.terminal.rename(termId, st.info.id, title); } catch (e) {}
+      }
+      view.write(fullCommand + '\r');
+      upsertRecord(termId, {
+        tabKey: rec.tabKey, contentId: rec.contentId, terminalId: rec.terminalId,
+        command: String(entry.command || ''), comment: String(entry.comment || ''),
+        marker: marker, kind: kind,
+        state: marker ? 'running' : 'untracked',
+        startedAt: Date.now()
+      });
+      if (marker) armWatcher(ctx, termId, rec.tabKey, view, marker, kind);
+      return true;
+    }
+
+    async function openCentralizedTab(ctx, termId, entry, params, fullCommand, marker, kind) {
+      var beforeKeys = terminalTabKeysOf(ctx, termId);
+      var beforeTerms = (await listTerminals(ctx, termId))
+        .map(function (info) { return info && info.id; })
+        .filter(Boolean);
+      await openTerminalTab(ctx, termId, params);
+      var tab = await discoverTabIn(ctx, termId, beforeKeys, 2500);
+      if (!tab) throw notAdoptedError();
+      var view = null;
+      try { view = ctx.webTerminals.view(termId, tabKeyOf(tab), tab.contentId, void 0, params.shellPath); } catch (e) { view = null; }
+      if (!(view && typeof view.write === 'function' && view.state && typeof view.state.getSnapshot === 'function')) {
+        return attachFallback(ctx, termId, beforeTerms, fullCommand, entry, null)
+          .then(function () { return { centralized: true }; });
+      }
+      try {
+        if (typeof view.refresh === 'function' && view.state.getSnapshot().phase === 'idle') view.refresh();
+      } catch (e) {}
+      var st;
+      try {
+        st = await waitForWritable(view, 12000);
+      } catch (e) {
+        // 集中会话里也得跑起来：兜底 attach 写入，不记台账（不可跟踪）
+        return attachFallback(ctx, termId, beforeTerms, fullCommand, entry, view)
+          .then(function () { return { centralized: true }; });
+      }
+      var title = String(entry.comment || entry.command).slice(0, 60);
+      var terminalId = st.info && st.info.id;
+      if (terminalId) {
+        try { await ctx.remote.terminal.rename(termId, terminalId, title); } catch (e) {}
+      }
+      view.write(fullCommand + '\r');
+      var tabKey = tabKeyOf(tab);
+      upsertRecord(termId, {
+        tabKey: tabKey, contentId: tab.contentId, terminalId: terminalId || null,
+        command: String(entry.command || ''), comment: String(entry.comment || ''),
+        marker: marker, kind: kind,
+        state: marker ? 'running' : 'untracked',
+        startedAt: Date.now()
+      });
+      if (marker) armWatcher(ctx, termId, tabKey, view, marker, kind);
+      return { centralized: true };
+    }
+
+    function executeCommand(ctx, sessionId, entry) {
+      var run = function () {
+        var command = String(entry.command || '').trim();
+        if (!command) return Promise.reject(new Error('命令不能为空'));
+        if (!sessionId) return Promise.reject(new Error('无法获得当前会话'));
+        return runCentralized(ctx, sessionId, entry, command)
+          .then(function (r) { bootstrapHint = false; bumpCommand(entry.id); return r; })
+          .catch(function (err) {
+            if (err && err.reason === 'not-adopted') {
+              bootstrapHint = true;
+              return runLegacy(ctx, sessionId, entry, command).then(function () { return { fallback: true }; });
+            }
+            if (err && err.reason !== 'no-central') {
+              console.warn('[QCR] centralized run failed, falling back to current session:', err);
+            }
+            return runLegacy(ctx, sessionId, entry, command).then(function () { return {}; });
+          });
+      };
+      var result = execChain.then(run, run);
+      execChain = result.catch(function () { return null; });
+      return result;
+    }
+
+    /* ---------- host file sync (live store: ~/.dsh/quick-cmd-runner/commands.json) ----------
+       All /qcr-* commands run in a dedicated hidden sync session (created once via
+       remote.session.create, id cached in localStorage), so the user's current task
+       view never shows sync cards. Falls back to the visible session if the harness
+       exposes no session.create. */
+
+    var syncCtx = null;
+    var syncSessionId = null;
+    var chatSessionId = null;
+    var syncPromise = null;
+    var pushTimer = null;
+
+    function cachedSyncId() { try { return localStorage.getItem(SYNC_SESSION_KEY); } catch (e) { return null; } }
+    function setCachedSyncId(id) { try { if (id) localStorage.setItem(SYNC_SESSION_KEY, id); else localStorage.removeItem(SYNC_SESSION_KEY); } catch (e) {} }
+
+    function canCreateSession(ctx) {
+      return !!(ctx.remote && ctx.remote.session && typeof ctx.remote.session.create === 'function');
+    }
+
+    async function createSyncSession(ctx) {
+      var created = valueOf(await ctx.remote.session.create({}, signalAfter(15000)));
+      var id = created && (created.sessionId || created.id);
+      if (!id) throw new Error('session.create returned no sessionId');
+      try { valueOf(await ctx.remote.session.rename({ sessionId: id, title: 'QCR Sync' }, signalAfter(5000))); } catch (e) {}
+      setCachedSyncId(id);
+      return id;
+    }
+
+    function getSyncSession(ctx, forceNew) {
+      if (forceNew) { setCachedSyncId(null); syncSessionId = null; syncPromise = null; }
+      if (syncSessionId) return Promise.resolve(syncSessionId);
+      if (!syncPromise) {
+        syncPromise = (async function () {
+          if (!canCreateSession(ctx)) return null;
+          var id = cachedSyncId();
+          if (id) return id;
+          return await createSyncSession(ctx);
+        })();
+        syncPromise.catch(function () { syncPromise = null; });
+      }
+      return syncPromise.then(function (id) { if (id) syncSessionId = id; return id; });
+    }
+
+    async function execSyncCommand(ctx, line, timeoutMs) {
+      if (!ctx.remote || !ctx.remote.commands || typeof ctx.remote.commands.execute !== 'function') {
+        throw new Error('commands 服务不可用');
+      }
+      var hidden = canCreateSession(ctx);
+      var id = hidden ? await getSyncSession(ctx, false) : chatSessionId;
+      if (!id) throw new Error('无法获得同步会话');
+      var exec;
+      try {
+        exec = valueOf(await ctx.remote.commands.execute(id, line, [], signalAfter(timeoutMs || 15000)));
+      } catch (e) {
+        if (!hidden) throw e;
+        // 缓存的同步会话可能已被删除: 重建一次并重试
+        id = await getSyncSession(ctx, true);
+        exec = valueOf(await ctx.remote.commands.execute(id, line, [], signalAfter(timeoutMs || 15000)));
+      }
+      if (!exec) throw new Error('commands 服务未返回结果');
+      var result = exec.result || exec;
+      if (result && result.kind === 'error') throw new Error(result.text || 'command failed');
+      return result;
+    }
+
+    var pushChain = Promise.resolve();
+
+    function pushStore() {
+      if (!syncCtx || !storeState) return Promise.resolve(false);
+      var payload = JSON.stringify(storeState.commands); // 紧凑传输：host 落盘时自行 pretty
+      var ctxRef = syncCtx;
+      var next = pushChain
+        .then(function () { return execSyncCommand(ctxRef, '/qcr-save ' + payload, 15000); })
+        .then(function () { return true; });
+      pushChain = next.catch(function () { return false; });
+      return next;
+    }
+
     function schedulePush() {
-      if (!syncCtx || !syncSessionId) return;
+      if (!syncCtx) return;
       if (pushTimer) clearTimeout(pushTimer);
       pushTimer = setTimeout(function () {
         pushTimer = null;
@@ -498,36 +1006,207 @@ window.__ModuleLoader__.load({
       }, 800);
     }
 
-    async function reloadCommands(ctx, sessionId) {
-      if (!ctx.remote || !ctx.remote.commands || typeof ctx.remote.commands.execute !== 'function') {
-        throw new Error('commands 服务不可用');
+    /* ---------- v1.3.0：集中终端会话（「QCR 终端」）----------
+       所有命令终端集中开在一个专用会话里（多 tab），从任何聊天都能在会话列表
+       找到它。会话的侧栏 store 只有被打开过一次才会被宿主 adopt（openTabIn
+       才生效），因此每次应用启动后首条命令先验证 tab 真出现，没出现就回退到
+       当前会话执行并提示用户打开一次。 */
+
+    var termSessionId = null;
+    var termPromise = null;
+    var termValidated = false;
+    var bootstrapHint = false;
+
+    function cachedTermId() { try { return localStorage.getItem(TERM_SESSION_KEY); } catch (e) { return null; } }
+    function setCachedTermId(id) { try { if (id) localStorage.setItem(TERM_SESSION_KEY, id); else localStorage.removeItem(TERM_SESSION_KEY); } catch (e) {} }
+
+    async function createTermSession(ctx) {
+      var created = valueOf(await ctx.remote.session.create({}, signalAfter(15000)));
+      var id = created && (created.sessionId || created.id);
+      if (!id) throw new Error('session.create returned no sessionId');
+      try { valueOf(await ctx.remote.session.rename({ sessionId: id, title: TERM_SESSION_TITLE }, signalAfter(5000))); } catch (e) {}
+      setCachedTermId(id);
+      return id;
+    }
+
+    function getTermSession(ctx, forceNew) {
+      if (forceNew) { setCachedTermId(null); termSessionId = null; termPromise = null; }
+      if (termSessionId) return Promise.resolve(termSessionId);
+      if (!termPromise) {
+        termPromise = (async function () {
+          if (!canCreateSession(ctx)) return null;
+          var id = cachedTermId();
+          if (id) return id;
+          return await createTermSession(ctx);
+        })();
+        termPromise.catch(function () { termPromise = null; });
       }
-      var signal = signalAfter(10000);
-      var raw = await ctx.remote.commands.execute(sessionId, '/qcr-reload', [], signal);
-      var exec = valueOf(raw);
-      if (!exec) throw new Error('commands 服务未返回结果');
-      var result = exec.result || exec;
-      if (result && result.kind === 'error') throw new Error(result.text || 'reload failed');
+      return termPromise.then(function (id) { if (id) termSessionId = id; return id; });
+    }
+
+    /* ---------- v1.3.0：终端 tab 台账（复用依据）---------- */
+
+    var termRecordsCache = null;
+    var termWatchers = new Map();
+
+    function normalizeRecord(r) {
+      if (!r || !r.tabKey || !r.state) return null;
+      return {
+        tabKey: String(r.tabKey),
+        contentId: r.contentId != null ? r.contentId : null,
+        terminalId: r.terminalId != null ? r.terminalId : null,
+        command: String(r.command || ''),
+        comment: String(r.comment || ''),
+        marker: r.marker != null ? String(r.marker) : null,
+        kind: r.kind || null,
+        state: String(r.state),
+        startedAt: Number.isFinite(r.startedAt) ? r.startedAt : 0
+      };
+    }
+
+    function loadTermRecords(sessionId) {
+      if (termRecordsCache && termRecordsCache.session === sessionId) return termRecordsCache.records;
+      var parsed = null;
+      try { parsed = JSON.parse(localStorage.getItem(TERM_RECORDS_KEY) || 'null'); } catch (e) { parsed = null; }
+      var records = [];
+      if (parsed && parsed.version === 1 && parsed.session === sessionId && Array.isArray(parsed.records)) {
+        for (var i = 0; i < parsed.records.length; i++) {
+          var norm = normalizeRecord(parsed.records[i]);
+          if (norm) records.push(norm);
+        }
+      }
+      termRecordsCache = { version: 1, session: sessionId, records: records };
+      return records;
+    }
+
+    function saveTermRecords() {
+      if (!termRecordsCache) return;
+      try { localStorage.setItem(TERM_RECORDS_KEY, JSON.stringify(termRecordsCache)); } catch (e) {}
+    }
+
+    function upsertRecord(sessionId, rec) {
+      var records = loadTermRecords(sessionId);
+      var norm = normalizeRecord(rec);
+      if (!norm) return null;
+      var at = -1;
+      for (var i = 0; i < records.length; i++) if (records[i].tabKey === norm.tabKey) { at = i; break; }
+      if (at >= 0) records[at] = norm;
+      else records.unshift(norm);
+      if (records.length > TERM_RECORDS_MAX) {
+        records.sort(function (a, b) { return (b.startedAt || 0) - (a.startedAt || 0); });
+        records.length = TERM_RECORDS_MAX;
+      }
+      saveTermRecords();
+      return norm;
+    }
+
+    function setRecordState(sessionId, tabKey, state) {
+      var records = loadTermRecords(sessionId);
+      for (var i = 0; i < records.length; i++) {
+        if (records[i].tabKey === tabKey) {
+          records[i].state = String(state);
+          saveTermRecords();
+          return;
+        }
+      }
+    }
+
+    function removeRecord(sessionId, tabKey) {
+      var records = loadTermRecords(sessionId);
+      var next = records.filter(function (r) { return r.tabKey !== tabKey; });
+      if (next.length !== records.length) {
+      termRecordsCache.records = next;
+      saveTermRecords();
+      }
+    }
+
+    // 台账对账：用户已关闭的 tab（openTabs 里没了）记录作废
+    function reconcileRecords(ctx, sessionId) {
+      var open = terminalTabKeysOf(ctx, sessionId);
+      var records = loadTermRecords(sessionId);
+      var next = records.filter(function (r) { return open.indexOf(r.tabKey) >= 0; });
+      var changed = next.length !== records.length;
+      if (changed) {
+        termRecordsCache.records = next;
+        saveTermRecords();
+      }
+      return changed;
+    }
+
+    function disarmWatcher(tabKey) {
+      var off = termWatchers.get(tabKey);
+      if (off) { try { off(); } catch (e) {} termWatchers.delete(tabKey); }
+    }
+
+    // 被动观察：只订阅 TerminalView.state，绝不调 consume/acknowledge/mount，
+    // 帧的推进与确认全由挂载中的终端 UI 负责（隐藏 xterm 也在持续消费），无抢帧风险。
+    function armWatcher(ctx, sessionId, tabKey, view, marker, kind) {
+      disarmWatcher(tabKey);
+      if (!marker || !view || !view.state || typeof view.state.subscribe !== 'function') return;
+      var scanner = makeMarkerScanner(marker, kind === 'cmd' ? 2 : 1);
+      var lastRevision = -1;
+      var done = false;
+      var off = view.state.subscribe(function () {
+        if (done) return;
+        var st = null;
+        try { st = view.state.getSnapshot(); } catch (e) { return; }
+        if (st && st.info && st.info.state === 'exited') return finish('dead');
+        if (st && (st.phase === 'failed' || st.phase === 'closed')) return finish('dead');
+        var r = st && st.render;
+        if (!r || r.revision === lastRevision) return;
+        lastRevision = r.revision;
+        var frame = r.frame || {};
+        var isSnapshot = frame.type === 'snapshot';
+        var chunk = isSnapshot ? frame.screen : frame.data;
+        if (typeof chunk !== 'string') return;
+        if (scanner.push(chunk, isSnapshot)) return finish('idle');
+      });
+      function finish(state) {
+        if (done) return;
+        done = true;
+        try { off(); } catch (e) {}
+        if (termWatchers.get(tabKey) === off) termWatchers.delete(tabKey);
+        setRecordState(sessionId, tabKey, state);
+      }
+      termWatchers.set(tabKey, off);
+    }
+
+
+    // reload 的镜像语义：以文件为准（手改的增/删/改都生效，本地独有条目不保留），
+    // 仅对双方都存在的同 id 条目沿用本地的运行统计（runs/lastRun/created）。
+    function mirrorReload(current, fileEntries) {
+      var curById = new Map();
+      var cur = Array.isArray(current) ? current : [];
+      for (var j = 0; j < cur.length; j++) curById.set(cur[j].id, cur[j]);
+      var out = [];
+      for (var k = 0; k < fileEntries.length; k++) {
+        var existing = curById.get(fileEntries[k].id);
+        out.push(existing
+          ? Object.assign({}, fileEntries[k], { runs: existing.runs, lastRun: existing.lastRun, created: existing.created })
+          : fileEntries[k]);
+      }
+      return sortCommands(rankByUsage(out).slice(0, MAX_ENTRIES));
+    }
+
+    async function reloadCommands(ctx) {
+      var result = await execSyncCommand(ctx, '/qcr-reload', 10000);
       var text = result && typeof result.text === 'string' ? result.text : '';
-      var parsed = JSON.parse(text);
+      var parsed = text.trim() ? JSON.parse(text) : []; // 手动清空文件视为空列表, 不报 JSON 错
       if (!Array.isArray(parsed)) throw new Error('commands.json 不是数组');
       var valid = [];
       for (var i = 0; i < parsed.length; i++) {
         var norm = normalizeEntry(parsed[i]);
         if (norm) valid.push(norm);
       }
-      mutate(function (s) {
-        var byId = new Map();
-        for (var j = 0; j < s.commands.length; j++) byId.set(s.commands[j].id, s.commands[j]);
-        for (var k = 0; k < valid.length; k++) {
-          var existing = byId.get(valid[k].id);
-          byId.set(valid[k].id, existing
-            ? Object.assign({}, valid[k], { runs: existing.runs, lastRun: existing.lastRun, created: existing.created })
-            : valid[k]);
-        }
-        try { localStorage.setItem(SEED_FLAG_KEY, '1'); } catch (e) {}
-        return { version: 1, commands: sortCommands(Array.from(byId.values())).slice(0, MAX_ENTRIES) };
-      });
+      var mirrored = mirrorReload(storeState ? storeState.commands : [], valid);
+      try { localStorage.setItem(SEED_FLAG_KEY, '1'); } catch (e) {}
+      var mirroredJson = JSON.stringify(mirrored);
+      if (mirroredJson !== JSON.stringify(storeState ? storeState.commands : [])) {
+        mutate(function () { return { version: 1, commands: mirrored }; }, true); // silent: 以文件为准, 不回写文件
+      }
+      if (mirroredJson !== JSON.stringify(valid)) {
+        pushStore().catch(function (e) { console.warn('[QCR] store file update failed:', e); });
+      }
       return valid.length;
     }
 
@@ -686,6 +1365,7 @@ window.__ModuleLoader__.load({
       var t = props.t;
       var execute = props.execute;
       var loadShells = props.loadShells;
+      var needsBootstrap = props.needsBootstrap;
       var snap = useStoreSnapshot();
       var queryState = React.useState('');
       var query = queryState[0];
@@ -703,6 +1383,9 @@ window.__ModuleLoader__.load({
       var shells = shellsState[0];
       var setShells = shellsState[1];
       var statusTimer = React.useRef(null);
+      React.useEffect(function () {
+        return function () { if (statusTimer.current) clearTimeout(statusTimer.current); };
+      }, []);
       var reloadState = React.useState(false);
       var reloading = reloadState[0];
       var setReloading = reloadState[1];
@@ -717,15 +1400,15 @@ window.__ModuleLoader__.load({
         return function () { cancelled = true; };
       }, [sessionId]);
 
-      // 启动同步: 面板装载后从 ~/.dsh/quick-cmd-runner/commands.json 合并一次(文件为准的内容 + 本地统计)
+      // 启动同步: 面板装载后从 commands.json 合并一次(隐藏同步会话执行, 当前视图无噪音; 每次装载仅一次)
       React.useEffect(function () {
-        if (typeof props.reload !== 'function' || !sessionId) return undefined;
+        if (typeof props.reload !== 'function') return undefined;
         var cancelled = false;
-        Promise.resolve(props.reload(sessionId)).then(function (n) {
+        Promise.resolve(props.reload()).then(function (n) {
           if (!cancelled && n) console.info('[QCR] startup sync merged ' + n + ' entry(ies) from store file');
         }).catch(function (e) { console.warn('[QCR] startup sync failed:', e); });
         return function () { cancelled = true; };
-      }, [sessionId]);
+      }, []);
 
       function showStatus(type, text) {
         if (statusTimer.current) clearTimeout(statusTimer.current);
@@ -735,14 +1418,20 @@ window.__ModuleLoader__.load({
 
       function run(entry) {
         if (!execute) { showStatus('error', t('status.error')); return; }
-        if (busyIds.has(entry.id)) return;
+        if (runningIds.has(entry.id)) return; // 同步防抖: 同一渲染帧内连点也只跑一次
+        runningIds.add(entry.id);
         var next = new Set(busyIds);
         next.add(entry.id);
         setBusyIds(next);
         Promise.resolve(execute(sessionId, entry))
-          .then(function () { showStatus('ok', t('status.ok')); })
+          .then(function (r) {
+            if (r && r.fallback) showStatus('warn', t('status.fallback'));
+            else if (r && r.centralized) showStatus('ok', t('status.okCentral'));
+            else showStatus('ok', t('status.ok'));
+          })
           .catch(function (err) { showStatus('error', String((err && err.message) || err)); })
           .then(function () {
+            runningIds.delete(entry.id);
             setBusyIds(function (prev) {
               var copy = new Set(prev);
               copy.delete(entry.id);
@@ -755,7 +1444,7 @@ window.__ModuleLoader__.load({
         if (reloading) return;
         if (!props.reload) { showStatus('error', t('status.reloadFailed')); return; }
         setReloading(true);
-        Promise.resolve(props.reload(sessionId))
+        Promise.resolve(props.reload())
           .then(function (count) {
             showStatus('ok', count > 0 ? t('status.reloadedOk') + '：' + count + ' 条' : t('status.reloadedNone'));
           })
@@ -774,7 +1463,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'qcr-head' },
           h('span', { className: 'qcr-headtitle' }, t('panel.title')),
           h('span', { className: 'qcr-headbtns' },
-            h('button', { className: 'qcr-btn', disabled: reloading, onClick: doReload },
+            h('button', { className: 'qcr-btn', disabled: reloading, onClick: doReload, title: t('hint.reloadMirror') },
               reloading ? h('span', { className: 'qcr-spin' }) : null, t('panel.reload')),
             h('button', { className: 'qcr-btn', onClick: function () { setDraft({ command: '', comment: '', shell: 'auto' }); } },
               h(PlusIcon, { size: 12 }), t('panel.add'))
@@ -788,6 +1477,9 @@ window.__ModuleLoader__.load({
           query ? h('button', { className: 'qcr-tool', onClick: function () { setQuery(''); } }, t('panel.clear')) : null
         ),
         status ? h('div', { className: 'qcr-status qcr-status-' + status.type }, status.text) : null,
+        typeof needsBootstrap === 'function' && needsBootstrap()
+          ? h('div', { className: 'qcr-bootstrap' }, t('bootstrap.hint'))
+          : null,
         rows.length ? h('div', { className: 'qcr-list' }, (function () {
           function mk(entry) {
             return h(CommandRow, {
@@ -817,13 +1509,13 @@ window.__ModuleLoader__.load({
     /* ---------- apply ---------- */
 
     function apply(ctx) {
-      console.info('[QCR] client module loaded (v3, host-file sync)');
+      console.info('[QCR] client module loaded (v8, centralized term session + keepMounted)');
       syncCtx = ctx;
       var t = ctx.locale.bind(NS);
       ctx.effect(function () { return ctx.locale.register(NS, { zh: ZH, en: EN }); }, PACKAGE_ID + ': dictionaries');
       var execute = function (sessionId, entry) { return executeCommand(ctx, sessionId, entry); };
       var loadShells = function (sessionId) { return loadShellsFor(ctx, sessionId); };
-      var reload = function (sessionId) { return reloadCommands(ctx, sessionId); };
+      var reload = function () { return reloadCommands(ctx); };
       ctx.effect(function () {
         try {
           return ctx.sidebarRightTabs.register({
@@ -841,6 +1533,26 @@ window.__ModuleLoader__.load({
           });
         } catch (e) { console.error('[QCR] tab register failed', e); }
       }, PACKAGE_ID + ': tab type');
+      // 终端 tab 类型接管（extension band 盖过 builtin，卸载自动回退）：
+      // keepMounted 修掉切 tab 迟滞，也是集中会话后台持续出帧的前提
+      ctx.effect(function () {
+        try {
+          return ctx.sidebarRightTabs.register({
+            id: PACKAGE_ID + ':terminal-keepalive',
+            kind: 'terminal',
+            multiple: true,
+            priority: 'extension',
+            keepMounted: true,
+            title: function () { return t('term.title'); },
+            guide: [{
+              id: 'new', order: 20,
+              title: function () { return t('term.new'); },
+              description: function () { return t('term.description'); },
+              icon: TerminalArtwork || TerminalIcon
+            }]
+          });
+        } catch (e) { console.error('[QCR] terminal keepMounted register failed', e); }
+      }, PACKAGE_ID + ': terminal keepalive');
       ctx.effect(function () {
         try {
           return ctx.slots.inject('sidebar.right.pane.tab', function () {
@@ -848,15 +1560,52 @@ window.__ModuleLoader__.load({
               name: 'sidebar.right.pane.tab',
               key: PACKAGE_ID,
               locale: NS,
-              inject: function (sessionId) { if (sessionId) syncSessionId = sessionId; return { t: t, execute: execute, loadShells: loadShells, reload: reload, sessionId: sessionId }; }
+              inject: function (sessionId) {
+                if (sessionId) chatSessionId = sessionId;
+                return {
+                  t: t, execute: execute, loadShells: loadShells, reload: reload,
+                  sessionId: sessionId,
+                  needsBootstrap: function () { return bootstrapHint; }
+                };
+              }
             }, QuickCmdPanel);
           });
         } catch (e) { console.error('[QCR] panel slot failed', e); }
       }, PACKAGE_ID + ': panel');
-      injectCss();
+      ctx.effect(function () {
+        injectCss();
+        return function () {
+          try {
+            var el = document.querySelector('style[data-plugin-css=' + JSON.stringify(CSS_KEY) + ']');
+            if (el && el.parentNode) el.parentNode.removeChild(el);
+          } catch (e) {}
+        };
+      }, PACKAGE_ID + ': css');
+      ctx.effect(function () {
+        return function () { if (pushTimer) { clearTimeout(pushTimer); pushTimer = null; } };
+      }, PACKAGE_ID + ': push timer');
     }
 
-    var inject = ['slots', 'locale', 'sidebarRight', 'sidebarRightTabs', 'webTerminals', 'remote', 'remote.commands', 'remote.terminal'];
+    // 仅供 tools/test-core.mjs 使用：浏览器里 process 不存在，这段不会执行
+    try {
+      if (typeof process !== 'undefined' && process.env && process.env.DSH_QCR_TEST) {
+        exports._test = {
+          detectShellKind: detectShellKind, kindOfShellPath: kindOfShellPath, pickShellPath: pickShellPath,
+          normalizeEntry: normalizeEntry, sortCommands: sortCommands, rankByUsage: rankByUsage,
+          formatLastRun: formatLastRun, isToday: isToday, updateCommand: updateCommand,
+          mirrorReload: mirrorReload, MAX_ENTRIES: MAX_ENTRIES, CSS: CSS,
+          escQuotePosix: escQuotePosix, escQuotePs: escQuotePs, cdPrefix: cdPrefix,
+          wrapCommand: wrapCommand, stripAnsi: stripAnsi, makeMarkerScanner: makeMarkerScanner,
+          pickReusable: pickReusable, normalizeRecord: normalizeRecord,
+          nextMarker: nextMarker, upsertRecord: upsertRecord, setRecordState: setRecordState,
+          removeRecord: removeRecord, loadTermRecords: loadTermRecords, reconcileRecords: reconcileRecords,
+          MARKER_HEAD: MARKER_HEAD, MARKER_TAIL: MARKER_TAIL, TERM_RECORDS_MAX: TERM_RECORDS_MAX,
+          TERM_RECORDS_KEY: TERM_RECORDS_KEY, TERM_SESSION_KEY: TERM_SESSION_KEY,
+          ZH: ZH, EN: EN
+        };
+      }
+    } catch (e) { /* 测试钩子不可用时静默 */ }
+    var inject = ['slots', 'locale', 'sidebarRight', 'sidebarRightTabs', 'webTerminals', 'remote', 'remote.commands', 'remote.terminal', 'remote.session'];
     exports.apply = apply;
     exports.inject = inject;
     return module.exports;

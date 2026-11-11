@@ -1,6 +1,6 @@
 {
   "name": "dsh-quick-cmd-runner",
-  "version": "1.1.0",
+  "version": "1.3.0",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -8,13 +8,16 @@
     "url": "git+https://github.com/skawingh/dsh-quick-cmd-runner.git"
   },
   "keywords": ["dsh", "dsh-plugin", "terminal", "quick-command"],
+  "scripts": {
+    "test": "node tools/test-core.mjs"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
-  "files": ["index.js", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg"],
+  "files": ["index.js", "client.js", "commands.json", "cordis.patch.yml", "locale/*.json", "icon.svg", "README.md", "tools/"],
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": {
