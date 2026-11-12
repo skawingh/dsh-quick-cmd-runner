@@ -8,12 +8,6 @@ window.__ModuleLoader__.load({
     var h = React.createElement;
     var ReactDOM = null;
     try { ReactDOM = require('react-dom'); } catch (e) { ReactDOM = null; }
-    // 官方终端图件（存在才用；测试桩/旧宿主缺包时退回自绘 TerminalIcon）
-    var TerminalArtwork = null;
-    try {
-      var primitives = require('@deepseek-ai/dsh-client-ui-primitives');
-      TerminalArtwork = primitives && primitives.PluginArtworkTerminal ? primitives.PluginArtworkTerminal : null;
-    } catch (e) { TerminalArtwork = null; }
 
     var NS = 'quickCmdRunner';
     var PACKAGE_ID = 'dsh-quick-cmd-runner';
@@ -67,9 +61,6 @@ window.__ModuleLoader__.load({
       'status.reloadedOk': '已从 commands.json 重新加载',
       'status.reloadedNone': 'commands.json 为空，本地列表已同步清空',
       'status.reloadFailed': '重载失败',
-      'term.title': '终端',
-      'term.new': '新建终端',
-      'term.description': '在会话工作区运行命令',
       'status.okCentral': '已在「QCR 终端」会话运行',
       'status.fallback': '「QCR 终端」会话本次启动还没打开过，本次在当前会话运行',
       'bootstrap.hint': '在左侧会话列表打开一次「QCR 终端」会话，之后命令都会集中到那里的多标签终端执行'
@@ -107,9 +98,6 @@ window.__ModuleLoader__.load({
       'status.reloadedOk': 'Reloaded from commands.json',
       'status.reloadedNone': 'commands.json is empty; the local list was cleared to match',
       'status.reloadFailed': 'Reload failed',
-      'term.title': 'Terminal',
-      'term.new': 'New terminal',
-      'term.description': 'Run commands in the Session workspace',
       'status.okCentral': 'Running in the "QCR Terminal" session',
       'status.fallback': 'The "QCR Terminal" session has not been opened since launch; running in the current session',
       'bootstrap.hint': 'Open the "QCR Terminal" session in the session list once; commands will then centralize into its multi-tab terminals'
@@ -131,6 +119,18 @@ window.__ModuleLoader__.load({
         if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) return AbortSignal.timeout(ms);
       } catch (e) {}
       return undefined;
+    }
+
+    // 宿主 44.x client api 按参数个数严格校验：session/create 与 session/rename 的描述符
+    // 没有 cancellation 字段（只收 1 个参数，传 AbortSignal 会报
+    // "client api: session/create expected 1 argument(s), got 2"）；超时只能客户端兜底，
+    // 慢成功落为孤儿会话，无害
+    function withTimeout(promise, ms) {
+      promise.catch(function () {}); // 慢结果输了竞速也补上 rejection 处理，避免 unhandled rejection
+      return Promise.race([
+        promise,
+        new Promise(function (_, reject) { setTimeout(function () { reject(new Error('session call timed out')); }, ms); })
+      ]);
     }
 
     function newId() {
@@ -939,10 +939,10 @@ window.__ModuleLoader__.load({
     }
 
     async function createSyncSession(ctx) {
-      var created = valueOf(await ctx.remote.session.create({}, signalAfter(15000)));
+      var created = valueOf(await withTimeout(ctx.remote.session.create({}), 15000));
       var id = created && (created.sessionId || created.id);
       if (!id) throw new Error('session.create returned no sessionId');
-      try { valueOf(await ctx.remote.session.rename({ sessionId: id, title: 'QCR Sync' }, signalAfter(5000))); } catch (e) {}
+      try { valueOf(await withTimeout(ctx.remote.session.rename({ sessionId: id, title: 'QCR Sync' }), 5000)); } catch (e) {}
       setCachedSyncId(id);
       return id;
     }
@@ -1021,10 +1021,10 @@ window.__ModuleLoader__.load({
     function setCachedTermId(id) { try { if (id) localStorage.setItem(TERM_SESSION_KEY, id); else localStorage.removeItem(TERM_SESSION_KEY); } catch (e) {} }
 
     async function createTermSession(ctx) {
-      var created = valueOf(await ctx.remote.session.create({}, signalAfter(15000)));
+      var created = valueOf(await withTimeout(ctx.remote.session.create({}), 15000));
       var id = created && (created.sessionId || created.id);
       if (!id) throw new Error('session.create returned no sessionId');
-      try { valueOf(await ctx.remote.session.rename({ sessionId: id, title: TERM_SESSION_TITLE }, signalAfter(5000))); } catch (e) {}
+      try { valueOf(await withTimeout(ctx.remote.session.rename({ sessionId: id, title: TERM_SESSION_TITLE }), 5000)); } catch (e) {}
       setCachedTermId(id);
       return id;
     }
@@ -1509,7 +1509,7 @@ window.__ModuleLoader__.load({
     /* ---------- apply ---------- */
 
     function apply(ctx) {
-      console.info('[QCR] client module loaded (v8, centralized term session + keepMounted)');
+      console.info('[QCR] client module loaded (v9, host-44 session-create arity fix)');
       syncCtx = ctx;
       var t = ctx.locale.bind(NS);
       ctx.effect(function () { return ctx.locale.register(NS, { zh: ZH, en: EN }); }, PACKAGE_ID + ': dictionaries');
@@ -1533,26 +1533,11 @@ window.__ModuleLoader__.load({
           });
         } catch (e) { console.error('[QCR] tab register failed', e); }
       }, PACKAGE_ID + ': tab type');
-      // 终端 tab 类型接管（extension band 盖过 builtin，卸载自动回退）：
-      // keepMounted 修掉切 tab 迟滞，也是集中会话后台持续出帧的前提
-      ctx.effect(function () {
-        try {
-          return ctx.sidebarRightTabs.register({
-            id: PACKAGE_ID + ':terminal-keepalive',
-            kind: 'terminal',
-            multiple: true,
-            priority: 'extension',
-            keepMounted: true,
-            title: function () { return t('term.title'); },
-            guide: [{
-              id: 'new', order: 20,
-              title: function () { return t('term.new'); },
-              description: function () { return t('term.description'); },
-              icon: TerminalArtwork || TerminalIcon
-            }]
-          });
-        } catch (e) { console.error('[QCR] terminal keepMounted register failed', e); }
-      }, PACKAGE_ID + ': terminal keepalive');
+      // v1.3.2：不再以 extension 接管 terminal 类型。宿主正文席位按「生效定义 id」
+      // 分发（sidebar-right 契约：一个 tab 类型 = 共用 id 的定义 + 同 key 正文 slot
+      // 两次注册），接管后必须自带正文组件；官方 LazyTerminalBody 不可复用，
+      // 缺位则所有终端 tab 渲染「这类内容还没有可用的查看方式」。
+      // keepMounted 保活收益随之放弃（宿主无 per-tab keepMounted 入口）。
       ctx.effect(function () {
         try {
           return ctx.slots.inject('sidebar.right.pane.tab', function () {

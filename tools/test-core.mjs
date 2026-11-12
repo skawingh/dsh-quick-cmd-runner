@@ -273,8 +273,29 @@ check("zh 集中成功文案", ZH["status.okCentral"], "已在「QCR 终端」�
 check("zh 回退文案", ZH["status.fallback"].includes("还没打开过"), true);
 check("zh bootstrap 提示", ZH["bootstrap.hint"].includes("QCR 终端"), true);
 check("en 集中成功文案", EN["status.okCentral"], 'Running in the "QCR Terminal" session');
-check("zh 终端三件套", [ZH["term.title"], ZH["term.new"], ZH["term.description"]], ["终端", "新建终端", "在会话工作区运行命令"]);
-check("en 终端三件套", [EN["term.title"], EN["term.new"], EN["term.description"]], ["Terminal", "New terminal", "Run commands in the Session workspace"]);
+check("term.* 三件套已随接管路线移除", [ZH["term.title"], ZH["term.new"], ZH["term.description"], EN["term.title"], EN["term.new"], EN["term.description"]], [void 0, void 0, void 0, void 0, void 0, void 0]);
+
+// --- tab 类型定义 / 正文 slot 配对契约 ---
+// 宿主 sidebar.right.pane.tab 按「生效定义 id」分发正文（extension 盖过 builtin 后
+// entryKey 变成 extension 的 id）；没有同 key 正文 slot 的 kind 一律渲染
+// 「这类内容还没有可用的查看方式」。见官方文档 sidebar-right：一个 tab 类型 =
+// 共用 id 的两次注册。
+const tabDefs = [];
+const slotEntries = [];
+const fakeCtx = {
+  effect: (fn) => { const d = fn(); return typeof d === "function" ? d : () => {}; },
+  locale: { bind: () => (key) => String(key), register: () => () => {} },
+  sidebarRightTabs: { register: (definition) => { tabDefs.push(definition); return () => {}; } },
+  slots: {
+    inject: (name, factory) => { factory(); return () => {}; },
+    register: (options) => { slotEntries.push({ name: options.name, key: options.key }); return () => {}; },
+  },
+};
+mod.apply(fakeCtx);
+const unpaired = tabDefs.filter((d) => !slotEntries.some((e) => e.key === d.id)).map((d) => d.id);
+check("每个 tab 类型定义都有以自身 id 为 key 的正文 slot", unpaired, []);
+check("quickCmd 面板 tab 类型仍在", tabDefs.some((d) => d.kind === "quickCmd"), true);
+check("quickCmd 面板正文 slot key 与定义 id 一致", slotEntries.some((e) => e.key === tabDefs.find((d) => d.kind === "quickCmd").id), true);
 
 console.log(failures ? `\n${failures} 项失败` : "\n全部通过");
 process.exit(failures ? 1 : 0);
