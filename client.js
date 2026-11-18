@@ -27,6 +27,11 @@ window.__ModuleLoader__.load({
     var MAX_ENTRIES = 200;
     var SHELL_OPTIONS = ['auto', 'powershell', 'cmd', 'bash'];
     var SHELL_LABELS = { powershell: 'PowerShell', cmd: 'cmd', bash: 'bash' };
+    // 分组只是条目上的一个名字（group 字段），不另建注册表：commands.json 仍是
+    // 命令数组，host 的数组校验和手改文件都保持不变。颜色由名字确定性推导。
+    var GROUP_COLORS = ['#4c6ef5', '#12b886', '#f59f00', '#e8590c', '#7048e8',
+                        '#1098ad', '#d6336c', '#5c940d'];
+    var GROUP_NAME_MAX = 40;
 
     var ZH = {
       'tab.title': '常用命令行',
@@ -63,7 +68,21 @@ window.__ModuleLoader__.load({
       'status.reloadFailed': '重载失败',
       'status.okCentral': '已在「QCR 终端」会话运行',
       'status.fallback': '「QCR 终端」会话本次启动还没打开过，本次在当前会话运行',
-      'bootstrap.hint': '在左侧会话列表打开一次「QCR 终端」会话，之后命令都会集中到那里的多标签终端执行'
+      'bootstrap.hint': '在左侧会话列表打开一次「QCR 终端」会话，之后命令都会集中到那里的多标签终端执行',
+      'group.new': '新建分组',
+      'group.namePlaceholder': '例如: 数据入库',
+      'group.nameRequired': '分组名不能为空',
+      'group.members': '条命令',
+      'group.nameTaken': '已有同名分组，保存后会并进那个组',
+      'group.split': '拆分',
+      'group.splitConfirm': '拆分后组内命令仍在列表里，只是不再成组。确定拆分「{name}」？',
+      'group.dragHint': '把一条命令拖到另一条上即可建组',
+      'row.leaveGroup': '退出分组',
+      'panel.export': '导出',
+      'hint.export': '把当前命令列表导出为 JSON 文件（含注释、分组与运行统计）',
+      'status.exportedOk': '已导出',
+      'status.exportFailed': '导出失败',
+      'status.exportEmpty': '列表为空，没有可导出的命令'
     };
     var EN = {
       'tab.title': 'Quick Commands',
@@ -100,7 +119,21 @@ window.__ModuleLoader__.load({
       'status.reloadFailed': 'Reload failed',
       'status.okCentral': 'Running in the "QCR Terminal" session',
       'status.fallback': 'The "QCR Terminal" session has not been opened since launch; running in the current session',
-      'bootstrap.hint': 'Open the "QCR Terminal" session in the session list once; commands will then centralize into its multi-tab terminals'
+      'bootstrap.hint': 'Open the "QCR Terminal" session in the session list once; commands will then centralize into its multi-tab terminals',
+      'group.new': 'New group',
+      'group.namePlaceholder': 'e.g. data import',
+      'group.nameRequired': 'Group name required',
+      'group.members': 'commands',
+      'group.nameTaken': 'A group with this name exists; saving will merge into it',
+      'group.split': 'Split',
+      'group.splitConfirm': 'Splitting keeps the commands in the list, just no longer grouped. Split "{name}"?',
+      'group.dragHint': 'Drag one command onto another to create a group',
+      'row.leaveGroup': 'Leave group',
+      'panel.export': 'Export',
+      'hint.export': 'Export the command list to a JSON file (comments, groups and run stats included)',
+      'status.exportedOk': 'Exported',
+      'status.exportFailed': 'Export failed',
+      'status.exportEmpty': 'List is empty, nothing to export'
     };
 
     /* ---------- utilities ---------- */
@@ -219,6 +252,27 @@ window.__ModuleLoader__.load({
       return command + '; echo ' + marker.slice(0, marker.length - 2) + '""' + marker.slice(-2);
     }
 
+    // 按目标 tab 的 shell kind 组装最终命令（cd 前缀 + 完成标记包装）。
+    // kind 未知时不猜语法：不加 cd、不包装（宁可不增强也不把命令写坏）。
+    function composeCommand(command, cwd, kind, marker) {
+      if (!kind) return command;
+      return cdPrefix(kind, cwd) + (marker ? wrapCommand(command, kind, marker) : command);
+    }
+
+    // 台账清理：running 超过 24h 仍未见完成标记的记录判死（防观察器丢失后永久占用）
+    function sweepStaleRecords(records, now) {
+      var list = Array.isArray(records) ? records : [];
+      var changed = false;
+      for (var i = 0; i < list.length; i++) {
+        var r = list[i];
+        if (r && r.state === 'running' && now - (r.startedAt || 0) > 24 * 60 * 60 * 1000) {
+          r.state = 'dead';
+          changed = true;
+        }
+      }
+      return changed;
+    }
+
     function stripAnsi(text) {
       return String(text)
         .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
@@ -257,17 +311,24 @@ window.__ModuleLoader__.load({
       };
     }
 
-    // 复用必须 kind 匹配：cd/marker 语法按 shell 走，错配会直接把命令写坏；
-    // kind 未知（null）的记录是 untracked，永远不会进入 idle，这里双保险排除。
+    // 复用两级匹配：优先取同 kind 的最新 idle 记录（cd/marker 语法按 shell 走，
+    // 错配会直接把命令写坏）；只有 kind 未知（连宿主默认 shell 都推不出）的命令
+    // 才允许落到任意最新 idle 记录上，写命令时按目标 tab 的 kind 包装。
     function pickReusable(records, kind) {
       var list = Array.isArray(records) ? records : [];
       var best = null;
-      if (!kind) return null;
+      var any = null;
       for (var i = 0; i < list.length; i++) {
         var r = list[i];
-        if (r && r.state === 'idle' && r.kind === kind && (!best || r.startedAt > best.startedAt)) best = r;
+        if (!r || r.state !== 'idle') continue;
+        var ts = r.startedAt || 0;
+        if (kind) {
+          if (r.kind === kind && (!best || ts > (best.startedAt || 0))) best = r;
+        } else if (!any || ts > (any.startedAt || 0)) {
+          any = r;
+        }
       }
-      return best;
+      return best || (kind ? null : any);
     }
 
 
@@ -278,10 +339,18 @@ window.__ModuleLoader__.load({
         command: x.command,
         comment: typeof x.comment === 'string' ? x.comment : '',
         shell: SHELL_OPTIONS.indexOf(x.shell) >= 0 ? x.shell : 'auto',
+        group: normalizeGroupName(x.group),
         runs: Number.isFinite(x.runs) && x.runs > 0 ? x.runs : 0,
         lastRun: Number.isFinite(x.lastRun) ? x.lastRun : 0,
         created: Number.isFinite(x.created) ? x.created : Date.now()
       };
+    }
+
+    // 组名归一：非字符串一律当未分组，去首尾空白、连续空白折叠成一个空格，再按上限截断。
+    // 「数  据」与「数 据」在中文里看不出差别，不折叠就会变成两个组、两种颜色。
+    function normalizeGroupName(name) {
+      if (typeof name !== 'string') return '';
+      return name.trim().replace(/\s+/g, ' ').slice(0, GROUP_NAME_MAX);
     }
 
     // 按使用价值排序（runs→lastRun→created），仅用于超过 MAX_ENTRIES 时决定留存哪些条目
@@ -300,6 +369,129 @@ window.__ModuleLoader__.load({
         if (byTitle !== 0) return byTitle;
         return (b.lastRun - a.lastRun) || (b.runs - a.runs) || (a.created - b.created);
       });
+    }
+
+    /* ---------- 分组（纯函数） ---------- */
+
+    function groupOf(entry) {
+      // 统一走归一：存量数据/手改文件里的多空格名不能分裂成多个组
+      return entry ? normalizeGroupName(entry.group) : '';
+    }
+
+    // 现存组名：去重、非空、拼音升序（与命令排序同一套中文比较规则）
+    function groupNames(list) {
+      var seen = Object.create(null);
+      var out = [];
+      for (var i = 0; i < (list || []).length; i++) {
+        var g = groupOf(list[i]);
+        if (g && !seen[g]) { seen[g] = 1; out.push(g); }
+      }
+      return out.sort(function (a, b) { return a.localeCompare(b, 'zh'); });
+    }
+
+    function hashName(name) {
+      var h = 0;
+      for (var i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) & 0x7fffffff;
+      return h;
+    }
+
+    // 组名 → 颜色：同名永远同色（手改文件、重启、重载都不跳色）；组数没超过
+    // 调色板时保证互不重复，超了才允许复用
+    function groupColorMap(list) {
+      var names = groupNames(list);
+      var used = Object.create(null);
+      var map = Object.create(null);
+      for (var i = 0; i < names.length; i++) {
+        var start = hashName(names[i]) % GROUP_COLORS.length;
+        var picked = -1;
+        for (var k = 0; k < GROUP_COLORS.length; k++) {
+          var idx = (start + k) % GROUP_COLORS.length;
+          if (!used[idx]) { picked = idx; break; }
+        }
+        if (picked < 0) picked = start; // 组数超过调色板，放弃唯一性
+        else used[picked] = 1;
+        map[names[i]] = GROUP_COLORS[picked];
+      }
+      return map;
+    }
+
+    // 渲染分区：组在前（按组名拼音升序），未分组在後；组内按 sortCommands 排序
+    // colorSource 传全量命令，搜索过滤时颜色不会因命中集合变化而跳色
+    function buildSections(list, colorSource) {
+      var colors = groupColorMap(colorSource || list);
+      var names = groupNames(list);
+      var buckets = Object.create(null);
+      var loose = [];
+      for (var i = 0; i < (list || []).length; i++) {
+        var e = list[i];
+        var g = groupOf(e);
+        if (!g) { loose.push(e); continue; }
+        if (!buckets[g]) buckets[g] = [];
+        buckets[g].push(e);
+      }
+      var groups = names.map(function (name) {
+        return { name: name, color: colors[name], entries: sortCommands(buckets[name] || []) };
+      });
+      return { groups: groups, loose: sortCommands(loose) };
+    }
+
+    // 组内不足两条自动解散：拖剩下一条时不该还留个空框
+    function normalizeGroups(list) {
+      var counts = Object.create(null);
+      for (var i = 0; i < (list || []).length; i++) {
+        var g = groupOf(list[i]);
+        if (g) counts[g] = (counts[g] || 0) + 1;
+      }
+      return (list || []).map(function (e) {
+        var g = groupOf(e);
+        if (!g || counts[g] >= 2) return e;
+        return Object.assign({}, e, { group: '' });
+      });
+    }
+
+    function setGroupOn(list, ids, name) {
+      var g = normalizeGroupName(name);
+      if (!g) return list;
+      var want = Object.create(null);
+      for (var i = 0; i < ids.length; i++) want[ids[i]] = 1;
+      return (list || []).map(function (e) {
+        return want[e.id] ? Object.assign({}, e, { group: g }) : e;
+      });
+    }
+
+    // 拖一条叠到另一条上：两条都归入新组（原组关系被覆盖）
+    function createGroupFrom(list, idA, idB, name) {
+      var g = normalizeGroupName(name);
+      if (!g) return list;
+      var has = Object.create(null);
+      for (var i = 0; i < (list || []).length; i++) has[list[i].id] = 1;
+      if (!has[idA] || !has[idB] || idA === idB) return list;
+      return setGroupOn(list, [idA, idB], g);
+    }
+
+    function removeFromGroup(list, ids) {
+      var want = Object.create(null);
+      for (var i = 0; i < ids.length; i++) want[ids[i]] = 1;
+      var cleared = (list || []).map(function (e) {
+        return want[e.id] && groupOf(e) ? Object.assign({}, e, { group: '' }) : e;
+      });
+      return normalizeGroups(cleared);
+    }
+
+    function splitGroup(list, name) {
+      var g = normalizeGroupName(name);
+      if (!g) return list;
+      return (list || []).map(function (e) {
+        return groupOf(e) === g ? Object.assign({}, e, { group: '' }) : e;
+      });
+    }
+
+    // 已存在同名组？建组时用来提示"会并进已有组"，避免静默合并
+    function hasGroup(list, name) {
+      var g = normalizeGroupName(name);
+      if (!g) return false;
+      for (var i = 0; i < (list || []).length; i++) if (groupOf(list[i]) === g) return true;
+      return false;
     }
 
     /* ---------- storage ---------- */
@@ -350,7 +542,7 @@ window.__ModuleLoader__.load({
             console.warn('[QCR] seed from commands.json failed:', e2);
           }
         }
-        return { version: 1, commands: sortCommands(out) };
+        return { version: 1, commands: normalizeGroups(sortCommands(out)) };
       } catch (e) {
         return { version: 1, commands: [] };
       }
@@ -383,16 +575,17 @@ window.__ModuleLoader__.load({
       var norm = normalizeEntry(entry);
       if (!norm) return;
       mutate(function (s) {
-        // 编辑只改 command/comment/shell；运行统计（runs/lastRun/created）沿自原条目，
-        // 否则改个 title 就把「今日已运行」清零（回归见 test-core）
-        return { version: 1, commands: sortCommands(s.commands.map(function (c) {
-          return c.id === norm.id ? Object.assign({}, norm, { runs: c.runs, lastRun: c.lastRun, created: c.created }) : c;
-        })) };
+        // 编辑只改 command/comment/shell；运行统计（runs/lastRun/created）与分组沿自原条目。
+        // 分组不能跟着 draft 走——编辑弹窗根本不带 group 字段，跟着走就是改个标题把命令踢出组。
+        return { version: 1, commands: sortCommands(normalizeGroups(s.commands.map(function (c) {
+          return c.id === norm.id ? Object.assign({}, norm, { group: c.group, runs: c.runs, lastRun: c.lastRun, created: c.created }) : c;
+        }))) };
       });
     }
 
     function removeCommand(id) {
-      mutate(function (s) { return { version: 1, commands: s.commands.filter(function (c) { return c.id !== id; }) }; });
+      // 删掉组里另一条时组会只剩一条，必须重跑一次自动解散，否则界面上留个单条组框
+      mutate(function (s) { return { version: 1, commands: normalizeGroups(s.commands.filter(function (c) { return c.id !== id; })) }; });
     }
 
     function bumpCommand(id) {
@@ -401,6 +594,59 @@ window.__ModuleLoader__.load({
           return c.id === id ? Object.assign({}, c, { runs: c.runs + 1, lastRun: Date.now() }) : c;
         })) };
       });
+    }
+
+    /* ---------- 导出（纯函数，供 _test 单测） ---------- */
+
+    var EXPORT_SCHEMA = 1;
+
+    // 导出文件名：quick-cmd-runner-YYYYMMDD-HHmmss.json（本地时间，秒级补零）
+    function exportFileName(at) {
+      var d = (typeof at === 'number' && Number.isFinite(at)) ? new Date(at) : new Date();
+      var p2 = function (n) { return (n < 10 ? '0' : '') + n; };
+      return 'quick-cmd-runner-' + d.getFullYear() + p2(d.getMonth() + 1) + p2(d.getDate())
+        + '-' + p2(d.getHours()) + p2(d.getMinutes()) + p2(d.getSeconds()) + '.json';
+    }
+
+    // 导出载荷：只收纯数据字段并逐字段归一，深拷贝，外部改原数组不影响已生成载荷
+    function exportPayload(commands, exportedAt) {
+      var list = Array.isArray(commands) ? commands : [];
+      var out = [];
+      for (var i = 0; i < list.length; i++) {
+        var c = list[i] || {};
+        out.push({
+          id: typeof c.id === 'string' ? c.id : '',
+          command: typeof c.command === 'string' ? c.command : '',
+          comment: typeof c.comment === 'string' ? c.comment : '',
+          shell: SHELL_OPTIONS.indexOf(c.shell) >= 0 ? c.shell : 'auto',
+          group: normalizeGroupName(c.group),
+          runs: Number.isFinite(c.runs) && c.runs > 0 ? c.runs : 0,
+          lastRun: Number.isFinite(c.lastRun) ? c.lastRun : 0,
+          created: Number.isFinite(c.created) ? c.created : 0
+        });
+      }
+      var d = (exportedAt == null) ? new Date() : new Date(exportedAt);
+      if (isNaN(d.getTime())) d = new Date();
+      return {
+        app: PACKAGE_ID,
+        schema: EXPORT_SCHEMA,
+        exportedAt: d.toISOString(),
+        count: out.length,
+        commands: out
+      };
+    }
+
+    // 浏览器侧下载（仅在面板点击时调用，不进单测）
+    function downloadJsonFile(filename, text) {
+      var blob = new Blob([text], { type: 'application/json' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function () { try { URL.revokeObjectURL(url); } catch (e) {} }, 1000);
     }
 
     function useStoreSnapshot() {
@@ -466,8 +712,19 @@ window.__ModuleLoader__.load({
       '.qcr-badge{min-width:18px;text-align:center;background:rgba(127,127,127,.18);border-radius:8px;padding:0 5px;font-size:10px;flex:none}' +
       '.qcr-time{font-size:10px;opacity:.6;white-space:nowrap;flex:none}' +
       '.qcr-divider{height:0;border-top:2px solid rgba(127,127,127,.45);margin:8px 2px;flex:none}' +
+      // 分组框：靠 --qcr-group-color 传色，边框 + 极淡底色做区分；组内行左侧留白显示归属
+      '.qcr-group{--qcr-group-color:#4c6ef5;border:1px solid var(--qcr-group-color);border-left-width:3px;border-radius:6px;margin:6px 0;padding:2px 4px 4px;background:rgba(127,127,127,.06);background:color-mix(in srgb,var(--qcr-group-color) 7%,transparent)}' +
+      '.qcr-grouphead{display:flex;align-items:center;gap:6px;padding:3px 4px;font-size:11px;font-weight:600;color:var(--qcr-group-color)}' +
+      '.qcr-groupdot{width:7px;height:7px;border-radius:50%;background:var(--qcr-group-color);flex:none}' +
+      '.qcr-groupname{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+      '.qcr-groupcount{font-weight:400;opacity:.7;flex:none}' +
+      '.qcr-row-grouped{padding-left:14px}' +
       '.qcr-tools{display:none;gap:2px;flex:none}' +
       '.qcr-row:hover .qcr-tools{display:flex}' +
+      // 组头不是 .qcr-row，hover 选择器不生效：拆分按钮常显
+      '.qcr-grouphead .qcr-tools{display:flex}' +
+      '.qcr-row.qcr-drop{outline:2px dashed #4c6ef5;outline-offset:-2px;background:rgba(76,110,245,.14)}' +
+      '.qcr-group.qcr-drop{border-style:dashed;background:rgba(76,110,245,.14)}' +
       '.qcr-tool{background:transparent;border:1px solid rgba(127,127,127,.35);border-radius:3px;color:inherit;padding:1px 4px;cursor:pointer;font-size:10px;line-height:1.4}' +
       '.qcr-tool:hover{border-color:#4c6ef5}' +
       '.qcr-empty{padding:18px 10px;text-align:center;opacity:.65}' +
@@ -486,6 +743,7 @@ window.__ModuleLoader__.load({
       '.qcr-field textarea,.qcr-field input,.qcr-field select{background:#2a2a30;color:inherit;border:1px solid rgba(127,127,127,.4);border-radius:4px;padding:5px 7px;font:inherit;width:100%;box-sizing:border-box}' +
       '.qcr-field textarea{font-family:Consolas,monospace;min-height:64px;resize:vertical}' +
       '.qcr-hint{font-size:11px;opacity:.75}' +
+      '.qcr-hint-warn{color:#f59f00;opacity:.95}' +
       '.qcr-actions{display:flex;justify-content:flex-end;gap:8px}' +
       '.qcr-btn{border:1px solid rgba(127,127,127,.4);background:transparent;color:inherit;border-radius:4px;padding:4px 12px;cursor:pointer;font:inherit;display:inline-flex;align-items:center;gap:4px}' +
       '.qcr-btn:hover{border-color:#4c6ef5}' +
@@ -803,28 +1061,39 @@ window.__ModuleLoader__.load({
       }
       var pinned = entry.shell && entry.shell !== 'auto' ? entry.shell : null;
       var kind = pinned || detectShellKind(command) || null;
+      var shells = null;
+      if (!kind) {
+        // 认不出的命令（python 等）改用宿主声明的默认 shell 补判 kind，
+        // 让它们也能带完成标记入池复用；推导失败才退回旧行为（无标记新 tab）。
+        try {
+          shells = await loadShellsFor(ctx, termId, signalAfter(5000));
+          if (shells && shells.length && shells[0] && shells[0].path) {
+            kind = kindOfShellPath(shells[0].path) || null;
+          }
+        } catch (e) { shells = null; }
+      }
       var cwd = null;
       try {
         var env = valueOf(await ctx.remote.terminal.environment(sessionId, signalAfter(4000)));
         cwd = (env && env.cwd) || null;
       } catch (e) { cwd = null; }
       var marker = kind ? nextMarker() : null;
-      var fullCommand = cdPrefix(kind, cwd) + (marker ? wrapCommand(command, kind, marker) : command);
       reconcileRecords(ctx, termId);
+      await sweepTermRecords(ctx, termId);
       var rec = pickReusable(loadTermRecords(termId), kind);
-      if (rec && await tryReuse(ctx, termId, rec, entry, fullCommand, marker, kind)) {
+      if (rec && await tryReuse(ctx, termId, rec, entry, command, cwd, marker)) {
         return { centralized: true };
       }
       var params = {};
       if (kind) {
-        var shells = await loadShellsFor(ctx, termId, signalAfter(5000));
+        if (!shells) shells = await loadShellsFor(ctx, termId, signalAfter(5000));
         var shellPath = pickShellPath(kind, shells);
         if (shellPath) params.shellPath = shellPath;
       }
-      return await openCentralizedTab(ctx, termId, entry, params, fullCommand, marker, kind);
+      return await openCentralizedTab(ctx, termId, entry, params, command, cwd, marker, kind);
     }
 
-    async function tryReuse(ctx, termId, rec, entry, fullCommand, marker, kind) {
+    async function tryReuse(ctx, termId, rec, entry, command, cwd, marker) {
       var infos = await listTerminals(ctx, termId);
       var alive = false;
       for (var i = 0; i < infos.length; i++) {
@@ -841,19 +1110,23 @@ window.__ModuleLoader__.load({
       if (st.info && st.info.id) {
         try { await ctx.remote.terminal.rename(termId, st.info.id, title); } catch (e) {}
       }
-      view.write(fullCommand + '\r');
+      // 目标 tab 的 shell kind 可能与命令推导 kind 不同（kind 未知的兜底复用）：
+      // cd/包装一律按目标 tab 的 kind 来，避免把命令写坏。
+      var tabKind = rec.kind || 'powershell';
+      view.write(composeCommand(command, cwd, tabKind, marker) + '\r');
       upsertRecord(termId, {
         tabKey: rec.tabKey, contentId: rec.contentId, terminalId: rec.terminalId,
         command: String(entry.command || ''), comment: String(entry.comment || ''),
-        marker: marker, kind: kind,
+        marker: marker, kind: rec.kind || null,
         state: marker ? 'running' : 'untracked',
         startedAt: Date.now()
       });
-      if (marker) armWatcher(ctx, termId, rec.tabKey, view, marker, kind);
+      if (marker) armWatcher(ctx, termId, rec.tabKey, view, marker, rec.kind);
       return true;
     }
 
-    async function openCentralizedTab(ctx, termId, entry, params, fullCommand, marker, kind) {
+    async function openCentralizedTab(ctx, termId, entry, params, command, cwd, marker, kind) {
+      var fullCommand = composeCommand(command, cwd, kind, marker);
       var beforeKeys = terminalTabKeysOf(ctx, termId);
       var beforeTerms = (await listTerminals(ctx, termId))
         .map(function (info) { return info && info.id; })
@@ -1133,6 +1406,36 @@ window.__ModuleLoader__.load({
       return changed;
     }
 
+    // 台账自愈（v1.4.3）：①running 超 24h 判死；②页面刷新后观察器丢失、但 tab
+    // 还开着的 running 记录按终端实况判死或重新挂观察器，避免复用池只减不增。
+    async function sweepTermRecords(ctx, sessionId) {
+      var records = loadTermRecords(sessionId);
+      if (sweepStaleRecords(records, Date.now())) saveTermRecords();
+      var states = null;
+      try {
+        var infos = await listTerminals(ctx, sessionId);
+        states = {};
+        for (var k = 0; k < infos.length; k++) {
+          if (infos[k] && infos[k].id) states[infos[k].id] = infos[k].state;
+        }
+      } catch (e) { states = null; }
+      var open = terminalTabKeysOf(ctx, sessionId);
+      for (var i = 0; i < records.length; i++) {
+        var r = records[i];
+        if (!r || r.state !== 'running' || !r.marker) continue;
+        var tstate = r.terminalId && states ? states[r.terminalId] : undefined;
+        if ((tstate && tstate !== 'running') || open.indexOf(r.tabKey) < 0) {
+          setRecordState(sessionId, r.tabKey, 'dead');
+          continue;
+        }
+        if (!tstate || termWatchers.has(r.tabKey)) continue;
+        var view = null;
+        try { view = ctx.webTerminals.view(sessionId, r.tabKey, r.contentId, void 0, void 0); } catch (e) { view = null; }
+        if (!view || !view.state) continue;
+        armWatcher(ctx, sessionId, r.tabKey, view, r.marker, r.kind);
+      }
+    }
+
     function disarmWatcher(tabKey) {
       var off = termWatchers.get(tabKey);
       if (off) { try { off(); } catch (e) {} termWatchers.delete(tabKey); }
@@ -1146,7 +1449,7 @@ window.__ModuleLoader__.load({
       var scanner = makeMarkerScanner(marker, kind === 'cmd' ? 2 : 1);
       var lastRevision = -1;
       var done = false;
-      var off = view.state.subscribe(function () {
+      function onStore() {
         if (done) return;
         var st = null;
         try { st = view.state.getSnapshot(); } catch (e) { return; }
@@ -1160,7 +1463,8 @@ window.__ModuleLoader__.load({
         var chunk = isSnapshot ? frame.screen : frame.data;
         if (typeof chunk !== 'string') return;
         if (scanner.push(chunk, isSnapshot)) return finish('idle');
-      });
+      }
+      var off = view.state.subscribe(onStore);
       function finish(state) {
         if (done) return;
         done = true;
@@ -1169,6 +1473,7 @@ window.__ModuleLoader__.load({
         setRecordState(sessionId, tabKey, state);
       }
       termWatchers.set(tabKey, off);
+      onStore(); // 补挂时立即查一次当前快照：命令可能已在观察器空窗期完成
     }
 
 
@@ -1185,7 +1490,7 @@ window.__ModuleLoader__.load({
           ? Object.assign({}, fileEntries[k], { runs: existing.runs, lastRun: existing.lastRun, created: existing.created })
           : fileEntries[k]);
       }
-      return sortCommands(rankByUsage(out).slice(0, MAX_ENTRIES));
+      return normalizeGroups(sortCommands(rankByUsage(out).slice(0, MAX_ENTRIES)));
     }
 
     async function reloadCommands(ctx) {
@@ -1240,10 +1545,22 @@ window.__ModuleLoader__.load({
       var entry = props.entry;
       var t = props.t;
       var busy = props.busy;
+      var grouped = !!groupOf(entry);
       return h('div', {
-        className: 'qcr-row' + (busy ? ' qcr-row-busy' : ''),
+        className: 'qcr-row' + (busy ? ' qcr-row-busy' : '') + (grouped ? ' qcr-row-grouped' : '') +
+          (props.dropOn ? ' qcr-drop' : ''),
         role: 'button', tabIndex: 0,
-        onClick: props.onRun,
+        draggable: !busy,
+        onClick: function (ev) {
+          // 拖拽松手后浏览器会补一个 click：别让"拖一下"变成"执行一次"
+          if (props.suppressClick && props.suppressClick()) { ev.preventDefault(); return; }
+          props.onRun();
+        },
+        onDragStart: function (ev) { props.onDragStart(ev, entry); },
+        onDragEnd: props.onDragEnd,
+        onDragOver: function (ev) { props.onDragOver(ev, 'row:' + entry.id); },
+        onDragLeave: props.onDragLeave,
+        onDrop: function (ev) { props.onDrop(ev, entry); },
         onKeyDown: function (ev) {
           if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); props.onRun(); }
         }
@@ -1256,6 +1573,7 @@ window.__ModuleLoader__.load({
         h('span', { className: 'qcr-badge' }, String(entry.runs || 0)),
         entry.lastRun > 0 ? h('span', { className: 'qcr-time', title: t('row.lastRun') + ': ' + formatLastRun(entry.lastRun, true) }, formatLastRun(entry.lastRun)) : null,
         h('span', { className: 'qcr-tools' },
+          grouped ? h('button', { className: 'qcr-tool', title: t('row.leaveGroup'), onClick: function (ev) { ev.stopPropagation(); props.onLeaveGroup(); } }, t('row.leaveGroup')) : null,
           h('button', { className: 'qcr-tool', title: t('row.edit'), onClick: function (ev) { ev.stopPropagation(); props.onEdit(); } }, t('row.edit')),
           h('button', { className: 'qcr-tool', title: t('row.clone'), onClick: function (ev) { ev.stopPropagation(); props.onClone(); } }, t('row.clone')),
           h('button', { className: 'qcr-tool', title: t('row.delete'), onClick: function (ev) { ev.stopPropagation(); props.onDelete(); } }, t('row.delete'))
@@ -1361,6 +1679,48 @@ window.__ModuleLoader__.load({
       return content;
     }
 
+    // 建组时要一个名字：复用命令弹窗那套遮罩/字段样式，保持观感一致
+    function GroupNameModal(props) {
+      var t = props.t;
+      var nameState = React.useState(props.initial || '');
+      var name = nameState[0];
+      var setName = nameState[1];
+      var ref = React.useRef(null);
+      React.useEffect(function () { if (ref.current) ref.current.focus(); }, []);
+      var trimmed = normalizeGroupName(name);
+      var taken = Array.isArray(props.takenNames) && props.takenNames.indexOf(trimmed) >= 0;
+      function save() { if (trimmed) props.onSave(trimmed); }
+      var body = h('div', {
+        className: 'qcr-modal', role: 'dialog',
+        onKeyDown: function (ev) {
+          if (ev.key === 'Escape') { ev.stopPropagation(); props.onCancel(); }
+          if (ev.key === 'Enter') { ev.preventDefault(); save(); }
+        }
+      },
+        h('h3', null, t('group.new')),
+        h('div', { className: 'qcr-field' },
+          h('label', null, t('group.new')),
+          h('input', {
+            ref: ref, type: 'text', value: name, maxLength: GROUP_NAME_MAX,
+            placeholder: t('group.namePlaceholder'),
+            onChange: function (ev) { setName(ev.target.value); }
+          }),
+          // 撞名提示：不改名会直接并进已有组，先让用户知道，别静默合并
+          taken ? h('div', { className: 'qcr-hint qcr-hint-warn' }, t('group.nameTaken')) : null
+        ),
+        h('div', { className: 'qcr-actions' },
+          h('button', { className: 'qcr-btn', onClick: props.onCancel }, t('modal.cancel')),
+          h('button', { className: 'qcr-btn qcr-btn-primary', disabled: !trimmed, onClick: save }, t('modal.save'))
+        )
+      );
+      var content = h('div', {
+        className: 'qcr-mask',
+        onClick: function (ev) { if (ev.target === ev.currentTarget) props.onCancel(); }
+      }, body);
+      if (ReactDOM && ReactDOM.createPortal) return h(Portal, null, content);
+      return content;
+    }
+
     function QuickCmdPanel(props) {
       var t = props.t;
       var execute = props.execute;
@@ -1454,15 +1814,157 @@ window.__ModuleLoader__.load({
           .then(function () { setReloading(false); });
       }
 
+      function doExport() {
+        var cmds = (snap && snap.commands) || [];
+        if (!cmds.length) { showStatus('warn', t('status.exportEmpty')); return; }
+        try {
+          var now = Date.now();
+          var payload = exportPayload(cmds, now);
+          downloadJsonFile(exportFileName(now), JSON.stringify(payload, null, 2));
+          showStatus('ok', t('status.exportedOk') + '：' + cmds.length + ' 条');
+        } catch (e) {
+          showStatus('error', t('status.exportFailed') + '：' + String((e && e.message) || e));
+        }
+      }
+
       var q = query.trim().toLowerCase();
       var rows = snap.commands.filter(function (c) {
         return !q || c.command.toLowerCase().indexOf(q) >= 0 || (c.comment || '').toLowerCase().indexOf(q) >= 0;
       });
 
+      // 拖拽状态放在 ref 里（拖动过程不该触发重渲染），只有落点高亮进 state
+      var dragIdRef = React.useRef(null);
+      var dragEndedAtRef = React.useRef(0);   // 拖拽刚结束 200ms 内的 click 一律吞掉
+      var dropState = React.useState(null);
+      var dropKey = dropState[0];
+      var setDropKey = dropState[1];
+      var pendingState = React.useState(null);
+      var pending = pendingState[0];
+      var setPending = pendingState[1];
+
+      function entryById(id) {
+        for (var i = 0; i < snap.commands.length; i++) if (snap.commands[i].id === id) return snap.commands[i];
+        return null;
+      }
+
+      // 所有分组变更都走这里：先改成员关系，再收拾只剩一条的孤儿组
+      function commitGroups(fn) {
+        mutate(function (s) { return { version: 1, commands: normalizeGroups(sortCommands(fn(s.commands))) }; });
+      }
+
+      function applyDrop(targetEntry) {
+        var id = dragIdRef.current;
+        dragIdRef.current = null;
+        setDropKey(null);
+        if (!id || !targetEntry || id === targetEntry.id) return;
+        if (targetEntry.group) { commitGroups(function (l) { return setGroupOn(l, [id], targetEntry.group); }); return; }
+        setPending({ ids: [id, targetEntry.id] });
+      }
+
+      function dropIntoGroup(name) {
+        var id = dragIdRef.current;
+        dragIdRef.current = null;
+        setDropKey(null);
+        var dragged = id ? entryById(id) : null;
+        if (!dragged || !name || dragged.group === name) return;
+        commitGroups(function (l) { return setGroupOn(l, [id], name); });
+      }
+
+      function dragHandlers(key) {
+        return {
+          onDragStart: function (ev, entry) {
+            dragIdRef.current = entry.id;
+            try {
+              ev.dataTransfer.effectAllowed = 'move';
+              ev.dataTransfer.setData('text/plain', entry.id);
+            } catch (e) {}
+          },
+          onDragEnd: function () { dragIdRef.current = null; dragEndedAtRef.current = Date.now(); setDropKey(null); },
+          onDragOver: function (ev, k) {
+            if (!dragIdRef.current) return;
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (dropKey !== k) setDropKey(k);
+          },
+          onDragLeave: function () { if (dropKey === key) setDropKey(null); },
+          onDrop: function (ev, entry) { ev.preventDefault(); ev.stopPropagation(); applyDrop(entry); }
+        };
+      }
+
+      function mk(entry, inGroup) {
+        var d = dragHandlers('row:' + entry.id);
+        return h(CommandRow, {
+          key: entry.id, entry: entry, t: t, busy: busyIds.has(entry.id),
+          dropOn: dropKey === 'row:' + entry.id,
+          suppressClick: function () { return Date.now() - dragEndedAtRef.current < 200; },
+          onDragStart: d.onDragStart, onDragEnd: d.onDragEnd,
+          onDragOver: d.onDragOver, onDragLeave: d.onDragLeave, onDrop: d.onDrop,
+          onRun: function () { run(entry); },
+          onEdit: function () { setDraft({ id: entry.id, command: entry.command, comment: entry.comment || '', shell: entry.shell || 'auto' }); },
+          onClone: function () { setDraft({ command: entry.command, comment: entry.comment || '', shell: entry.shell || 'auto' }); },
+          onDelete: function () {
+            if (typeof window !== 'undefined' && window.confirm && window.confirm(t('row.deleteConfirm'))) removeCommand(entry.id);
+          },
+          onLeaveGroup: inGroup ? function () {
+            commitGroups(function (l) { return removeFromGroup(l, [entry.id]); });
+          } : null
+        });
+      }
+
+      function renderSection(sec) {
+        var out = [];
+        sec.groups.forEach(function (g) {
+          var headDrop = dropKey === 'group:' + g.name;
+          out.push(h('div', {
+            key: 'grp:' + g.name,
+            className: 'qcr-group' + (headDrop ? ' qcr-drop' : ''),
+            style: { '--qcr-group-color': g.color },
+            onDragOver: function (ev) { if (!dragIdRef.current) return; ev.preventDefault(); ev.stopPropagation(); if (dropKey !== 'group:' + g.name) setDropKey('group:' + g.name); },
+            onDragLeave: function (ev) { if (ev.currentTarget === ev.target) setDropKey(null); },
+            onDrop: function (ev) { ev.preventDefault(); ev.stopPropagation(); dropIntoGroup(g.name); }
+          },
+            h('div', { className: 'qcr-grouphead' },
+              h('span', { className: 'qcr-groupdot' }),
+              h('span', { className: 'qcr-groupname', title: g.name }, g.name),
+              h('span', { className: 'qcr-groupcount' }, g.entries.length + ' ' + t('group.members')),
+              h('span', { className: 'qcr-tools' },
+                h('button', {
+                  className: 'qcr-tool', title: t('group.split'),
+                  onClick: function () {
+                    if (typeof window !== 'undefined' && window.confirm && window.confirm(t('group.splitConfirm').replace('{name}', g.name))) {
+                      commitGroups(function (l) { return splitGroup(l, g.name); });
+                    }
+                  }
+                }, t('group.split'))
+              )
+            ),
+            g.entries.map(function (e) { return mk(e, true); })
+          ));
+        });
+        var loose = sec.loose;
+        var ran = loose.filter(function (e) { return isToday(e.lastRun); });
+        var not = loose.filter(function (e) { return !isToday(e.lastRun); });
+        var looseNodes = ran.map(function (e) { return mk(e, false); });
+        if (ran.length && not.length) looseNodes.push(h('div', { key: 'qcr-divider', className: 'qcr-divider' }));
+        return out.concat(looseNodes, not.map(function (e) { return mk(e, false); }));
+      }
+
+      // 拖到列表空白处 = 退出分组（也可以点行内「退出分组」按钮）
+      function dropOnBlank(ev) {
+        var id = dragIdRef.current;
+        dragIdRef.current = null;
+        setDropKey(null);
+        var dragged = id ? entryById(id) : null;
+        if (!dragged || !dragged.group) return;
+        ev.preventDefault();
+        commitGroups(function (l) { return removeFromGroup(l, [id]); });
+      }
+
       return h('div', { className: 'qcr-root' },
         h('div', { className: 'qcr-head' },
           h('span', { className: 'qcr-headtitle' }, t('panel.title')),
           h('span', { className: 'qcr-headbtns' },
+            h('button', { className: 'qcr-btn', onClick: doExport, title: t('hint.export') }, t('panel.export')),
             h('button', { className: 'qcr-btn', disabled: reloading, onClick: doReload, title: t('hint.reloadMirror') },
               reloading ? h('span', { className: 'qcr-spin' }) : null, t('panel.reload')),
             h('button', { className: 'qcr-btn', onClick: function () { setDraft({ command: '', comment: '', shell: 'auto' }); } },
@@ -1480,24 +1982,21 @@ window.__ModuleLoader__.load({
         typeof needsBootstrap === 'function' && needsBootstrap()
           ? h('div', { className: 'qcr-bootstrap' }, t('bootstrap.hint'))
           : null,
-        rows.length ? h('div', { className: 'qcr-list' }, (function () {
-          function mk(entry) {
-            return h(CommandRow, {
-              key: entry.id, entry: entry, t: t, busy: busyIds.has(entry.id),
-              onRun: function () { run(entry); },
-              onEdit: function () { setDraft({ id: entry.id, command: entry.command, comment: entry.comment || '', shell: entry.shell || 'auto' }); },
-              onClone: function () { setDraft({ command: entry.command, comment: entry.comment || '', shell: entry.shell || 'auto' }); },
-              onDelete: function () {
-                if (typeof window !== 'undefined' && window.confirm && window.confirm(t('row.deleteConfirm'))) removeCommand(entry.id);
-              }
-            });
-          }
-          var ran = rows.filter(function (e) { return isToday(e.lastRun); });
-          var not = rows.filter(function (e) { return !isToday(e.lastRun); });
-          var out = ran.map(mk);
-          if (ran.length && not.length) out.push(h('div', { key: 'qcr-divider', className: 'qcr-divider' }));
-          return out.concat(not.map(mk));
-        })()) : h('div', { className: 'qcr-empty' }, q ? t('panel.noMatch') : t('panel.empty')),
+        rows.length ? h('div', {
+          className: 'qcr-list',
+          onDragOver: function (ev) { if (dragIdRef.current) { ev.preventDefault(); if (dropKey) setDropKey(null); } },
+          onDrop: dropOnBlank
+        }, renderSection(buildSections(rows, snap.commands))) : h('div', { className: 'qcr-empty' }, q ? t('panel.noMatch') : t('panel.empty')),
+        pending !== null ? h(GroupNameModal, {
+          t: t,
+          takenNames: groupNames(snap.commands),
+          onSave: function (name) {
+            var ids = pending.ids;
+            setPending(null);
+            commitGroups(function (l) { return setGroupOn(l, ids, name); });
+          },
+          onCancel: function () { setPending(null); }
+        }) : null,
         draft !== null ? h(CommandModal, {
           t: t, draft: draft, shells: shells,
           onSave: function (next) { if (draft.id) updateCommand(next); else addCommand(next); setDraft(null); },
@@ -1509,7 +2008,7 @@ window.__ModuleLoader__.load({
     /* ---------- apply ---------- */
 
     function apply(ctx) {
-      console.info('[QCR] client module loaded (v9, host-44 session-create arity fix)');
+      console.info('[QCR] client module loaded (v1.4.3, terminal reuse v2)');
       syncCtx = ctx;
       var t = ctx.locale.bind(NS);
       ctx.effect(function () { return ctx.locale.register(NS, { zh: ZH, en: EN }); }, PACKAGE_ID + ': dictionaries');
@@ -1577,15 +2076,24 @@ window.__ModuleLoader__.load({
         exports._test = {
           detectShellKind: detectShellKind, kindOfShellPath: kindOfShellPath, pickShellPath: pickShellPath,
           normalizeEntry: normalizeEntry, sortCommands: sortCommands, rankByUsage: rankByUsage,
-          formatLastRun: formatLastRun, isToday: isToday, updateCommand: updateCommand,
+          formatLastRun: formatLastRun, isToday: isToday, updateCommand: updateCommand, removeCommand: removeCommand,
           mirrorReload: mirrorReload, MAX_ENTRIES: MAX_ENTRIES, CSS: CSS,
           escQuotePosix: escQuotePosix, escQuotePs: escQuotePs, cdPrefix: cdPrefix,
           wrapCommand: wrapCommand, stripAnsi: stripAnsi, makeMarkerScanner: makeMarkerScanner,
-          pickReusable: pickReusable, normalizeRecord: normalizeRecord,
+          pickReusable: pickReusable, composeCommand: composeCommand, sweepStaleRecords: sweepStaleRecords,
+          normalizeRecord: normalizeRecord,
           nextMarker: nextMarker, upsertRecord: upsertRecord, setRecordState: setRecordState,
           removeRecord: removeRecord, loadTermRecords: loadTermRecords, reconcileRecords: reconcileRecords,
           MARKER_HEAD: MARKER_HEAD, MARKER_TAIL: MARKER_TAIL, TERM_RECORDS_MAX: TERM_RECORDS_MAX,
           TERM_RECORDS_KEY: TERM_RECORDS_KEY, TERM_SESSION_KEY: TERM_SESSION_KEY,
+          GROUP_COLORS: GROUP_COLORS, GROUP_NAME_MAX: GROUP_NAME_MAX,
+          normalizeGroupName: normalizeGroupName, groupOf: groupOf, groupNames: groupNames,
+          groupColorMap: groupColorMap, buildSections: buildSections, normalizeGroups: normalizeGroups,
+          setGroupOn: setGroupOn, createGroupFrom: createGroupFrom,
+          removeFromGroup: removeFromGroup, splitGroup: splitGroup, hasGroup: hasGroup,
+          exportFileName: exportFileName, exportPayload: exportPayload, EXPORT_SCHEMA: EXPORT_SCHEMA,
+          QuickCmdPanel: QuickCmdPanel, CommandRow: CommandRow,
+          resetStore: function () { storeState = null; },
           ZH: ZH, EN: EN
         };
       }
